@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Studio Video Clipper & Hardware Cropper</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --card-bg: #181b24;
+      --border: #282d3c;
+      --text-main: #f1f3f9;
+      --text-muted: #8a92a6;
+      --accent: #6366f1;
+      --accent-hover: #4f46e5;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --radius: 10px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background-color: var(--bg); color: var(--text-main); min-height: 100vh; padding: 24px; }
+    .container { max-width: 1300px; margin: 0 auto; }
+
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+    h1 { font-size: 1.5rem; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+    .badge { font-size: 0.75rem; padding: 4px 10px; border-radius: 999px; background: rgba(99, 102, 241, 0.15); color: #818cf8; font-weight: 600; border: 1px solid rgba(99, 102, 241, 0.3); }
+    .badge.hw { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 20px; }
+    .card-title { font-size: 1rem; font-weight: 600; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; }
+
+    label { display: block; font-size: 0.82rem; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+    input[type="text"], input[type="number"], select {
+      width: 100%; padding: 10px 12px; background: #12141c; border: 1px solid var(--border);
+      border-radius: 6px; color: var(--text-main); font-size: 0.9rem; margin-bottom: 14px; outline: none;
+    }
+    input[type="text"]:focus, select:focus { border-color: var(--accent); }
+
+    .btn-group { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+    .ratio-btn {
+      flex: 1; padding: 10px 8px; background: #12141c; border: 1px solid var(--border);
+      color: var(--text-main); border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 600;
+      transition: all 0.15s ease; text-align: center;
+    }
+    .ratio-btn:hover { border-color: var(--accent); }
+    .ratio-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+    .slider-container { margin-bottom: 14px; }
+    .slider-header { display: flex; justify-content: space-between; font-size: 0.82rem; color: var(--text-muted); margin-bottom: 6px; }
+    input[type="range"] {
+      width: 100%; height: 6px; -webkit-appearance: none; background: #282d3c; border-radius: 3px; outline: none;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--accent); cursor: pointer;
+    }
+
+    /* Visual Framing Box */
+    .framing-preview-box {
+      width: 100%; height: 180px; background: #0c0e14; border: 1px dashed var(--border);
+      border-radius: 8px; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center;
+      margin-bottom: 14px;
+    }
+    .video-canvas-rep {
+      position: relative; background: #1f2433; border: 1px solid #3c445c; border-radius: 4px;
+      height: 140px; aspect-ratio: 16 / 9; overflow: hidden;
+    }
+    .crop-cutout-rep {
+      position: absolute; top: 0; bottom: 0; border: 2px solid #6366f1; background: rgba(99, 102, 241, 0.25);
+      border-radius: 2px; box-shadow: 0 0 10px rgba(99, 102, 241, 0.4); transition: left 0.05s ease, width 0.1s ease;
+    }
+
+    .meta-tag { display: inline-block; font-size: 0.75rem; background: #12141c; padding: 2px 8px; border-radius: 4px; color: var(--text-muted); margin-right: 6px; }
+
+    .btn-primary {
+      width: 100%; padding: 14px; background: var(--accent); border: none; border-radius: 8px;
+      color: #fff; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.15s ease;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+    }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .btn-secondary {
+      padding: 8px 14px; background: #242938; border: 1px solid var(--border); border-radius: 6px;
+      color: var(--text-main); font-size: 0.85rem; font-weight: 500; cursor: pointer;
+    }
+    .btn-secondary:hover { background: #2f364a; }
+
+    /* Video Player */
+    .player-container {
+      background: #000; border-radius: 8px; overflow: hidden; position: relative;
+      min-height: 280px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--border);
+    }
+    video { width: 100%; max-height: 480px; border-radius: 8px; background: #000; }
+    .empty-player-text { color: var(--text-muted); font-size: 0.9rem; text-align: center; }
+
+    /* CLI Command Box */
+    .cli-box {
+      background: #0d0f15; border: 1px solid #202534; border-radius: 8px; padding: 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.82rem; color: #a5b4fc; word-break: break-all; margin-bottom: 12px; position: relative;
+    }
+    .cli-actions { display: flex; gap: 8px; }
+
+    /* Progress bar */
+    .progress-bar-wrap { width: 100%; background: #12141c; border-radius: 999px; height: 8px; overflow: hidden; margin-top: 10px; display: none; }
+    .progress-bar-fill { height: 100%; width: 0%; background: var(--success); transition: width 0.3s ease; }
+    .progress-text { font-size: 0.8rem; color: var(--text-muted); margin-top: 6px; display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>🎬 Studio Video Clipper & Hardware Cropper</h1>
+        <span style="font-size: 0.85rem; color: var(--text-muted);">Interactive Crop, Music Mixing & Subtitle Preview Engine</span>
+      </div>
+      <div>
+        {% if has_hw %}
+          <span class="badge hw">⚡ {{ hw_name }}</span>
+        {% else %}
+          <span class="badge">{{ hw_name }}</span>
+        {% endif %}
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- LEFT COLUMN: CONTROLS -->
+      <div>
+        <!-- 1. VIDEO SOURCE -->
+        <div class="card">
+          <div class="card-title">
+            <span>1. Choose Video Source</span>
+            <button class="btn-secondary" onclick="scanFiles()" style="font-size: 0.75rem;">🔄 Rescan Files</button>
+          </div>
+
+          <label>Select Detected Video File:</label>
+          <select id="videoSelect" onchange="onSelectVideo(this.value)">
+            <option value="">-- Choose local video --</option>
+          </select>
+
+          <label>Or Enter Custom Video Path:</label>
+          <input type="text" id="videoPath" placeholder="/Users/.../video.mp4" oninput="probeCurrentVideo()">
+
+          <div id="videoMeta" style="margin-top: -6px; margin-bottom: 10px; display: none;">
+            <span class="meta-tag" id="metaRes">1920x1080</span>
+            <span class="meta-tag" id="metaDur">00:00:00</span>
+            <span class="meta-tag" id="metaAudio">Audio: Yes</span>
+          </div>
+        </div>
+
+        <!-- 2. CROP & ASPECT RATIO -->
+        <div class="card">
+          <div class="card-title">2. Crop & Aspect Ratio</div>
+          
+          <label>Target Aspect Ratio:</label>
+          <div class="btn-group">
+            <button class="ratio-btn active" data-ratio="9:16" onclick="setRatio('9:16')">9:16 (Shorts/Reels)</button>
+            <button class="ratio-btn" data-ratio="1:1" onclick="setRatio('1:1')">1:1 (Square)</button>
+            <button class="ratio-btn" data-ratio="4:5" onclick="setRatio('4:5')">4:5 (Portrait)</button>
+            <button class="ratio-btn" data-ratio="original" onclick="setRatio('original')">16:9 (Original)</button>
+          </div>
+
+          <!-- Framing simulation -->
+          <div class="framing-preview-box">
+            <div class="video-canvas-rep" id="canvasRep">
+              <div class="crop-cutout-rep" id="cutoutRep"></div>
+            </div>
+          </div>
+
+          <div class="slider-container" id="posXContainer">
+            <div class="slider-header">
+              <span>Horizontal Crop Framing</span>
+              <span id="posXLabel">Center (50%)</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <button type="button" class="btn btn-secondary" onclick="nudgePosX(-1)" style="padding: 2px 10px; font-weight: bold; font-size: 1rem; border-radius: 4px;">-</button>
+              <input type="range" id="posXSlider" min="0" max="100" value="50" oninput="updateCropPosition(this.value)" style="flex: 1;">
+              <button type="button" class="btn btn-secondary" onclick="nudgePosX(1)" style="padding: 2px 10px; font-weight: bold; font-size: 1rem; border-radius: 4px;">+</button>
+            </div>
+          </div>
+
+          <div style="font-size: 0.8rem; color: var(--text-muted); display: flex; justify-content: space-between;">
+            <span>Generated Filter: <code id="cropFilterLabel" style="color: #a5b4fc;">crop=608:1080:656:0</code></span>
+          </div>
+        </div>
+
+        <!-- 3. CAPTIONS & SUBTITLES -->
+        <div class="card">
+          <div class="card-title">
+            <span>3. Subtitles & Captions (.srt)</span>
+            <input type="checkbox" id="subEnable" checked onchange="updateUIState()">
+          </div>
+
+          <div id="subSection">
+            <label>Select Master Transcript:</label>
+            <select id="srtSelect" onchange="document.getElementById('srtPath').value = this.value; generateCliCommand();">
+              <option value="">-- No subtitle selected --</option>
+            </select>
+
+            <label>Or Custom SRT Path:</label>
+            <input type="text" id="srtPath" placeholder="/Users/.../transcript.srt" oninput="generateCliCommand()">
+
+            <div style="display: flex; gap: 12px;">
+              <div style="flex: 1;">
+                <label>Text Color:</label>
+                <select id="fontColor" onchange="generateCliCommand()">
+                  <option value="&H00FFFFFF">White with Black Border</option>
+                  <option value="&H0000FFFF">Yellow with Black Border</option>
+                </select>
+              </div>
+              <div style="flex: 1;">
+                <label>Font Size:</label>
+                <select id="fontSize" onchange="generateCliCommand()">
+                  <option value="20">Small (20px)</option>
+                  <option value="24" selected>Medium (24px)</option>
+                  <option value="28">Large (28px)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4. BACKGROUND MUSIC & DUCKING -->
+        <div class="card">
+          <div class="card-title">
+            <span>4. Background Music & Ducking</span>
+            <input type="checkbox" id="musicEnable" checked onchange="updateUIState()">
+          </div>
+
+          <div id="musicSection">
+            <label>Select Music Track (.mp3 / .wav):</label>
+            <select id="musicSelect" onchange="document.getElementById('musicPath').value = this.value; generateCliCommand();">
+              <option value="">-- No music selected --</option>
+            </select>
+
+            <label>Or Custom Music Path:</label>
+            <input type="text" id="musicPath" placeholder="/Users/.../bg_music.mp3" oninput="generateCliCommand()">
+
+            <div class="slider-container">
+              <div class="slider-header">
+                <span>Background Volume (Ducking)</span>
+                <span id="volLabel">12%</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <button type="button" class="btn btn-secondary" onclick="nudgeVol(-1)" style="padding: 2px 10px; font-weight: bold; font-size: 1rem; border-radius: 4px;">-</button>
+                <input type="range" id="volSlider" min="0" max="50" value="12" oninput="updateMusicVolume(this.value)" style="flex: 1;">
+                <button type="button" class="btn btn-secondary" onclick="nudgeVol(1)" style="padding: 2px 10px; font-weight: bold; font-size: 1rem; border-radius: 4px;">+</button>
+              </div>
+              <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 4px;">
+                💡 10%–15% keeps spoken speech crisp and intelligible.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT COLUMN: PREVIEW & HEADLESS RUNNER -->
+      <div>
+        <!-- PREVIEW PLAYER -->
+        <div class="card">
+          <div class="card-title">
+            <span>1-Minute Rendered Preview</span>
+            <span id="previewStatus" style="font-size: 0.8rem; color: var(--text-muted);">Ready</span>
+          </div>
+
+          <div class="player-container" id="playerWrapper">
+            <div class="empty-player-text" id="emptyPlayerText">
+              🎬 Click <strong>"Generate 1-Min Preview"</strong> below to test crop, sound & subtitles.
+            </div>
+            <video id="previewVideo" controls style="display: none;"></video>
+          </div>
+
+          <div style="display: flex; gap: 12px; margin-top: 14px; align-items: flex-end;">
+            <div style="width: 140px;">
+              <label>Start Offset (sec):</label>
+              <input type="number" id="previewStart" value="0" min="0" style="margin-bottom: 0;">
+            </div>
+            <button class="btn-primary" id="btnPreview" onclick="generatePreview()">
+              <span>🎬 Generate 1-Min Preview</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- HEADLESS CLI COMMAND FOR FULL VIDEO -->
+        <div class="card">
+          <div class="card-title">
+            <span>🚀 Run Whole Video Headless (Command Line)</span>
+          </div>
+          <p style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 12px;">
+            This command runs directly in your terminal at full hardware speed (utilizing Apple Silicon Media Engine). Handles any video length—even <strong>10+ hours</strong>.
+          </p>
+
+          <div class="cli-box" id="cliCommandBox">
+            python3 process_full.py -v "..." -o "..." -r 9:16
+          </div>
+
+          <div class="cli-actions">
+            <button class="btn-secondary" onclick="copyCommand()">📋 Copy Command</button>
+            <button class="btn-secondary" style="background: rgba(16, 185, 129, 0.2); border-color: #10b981; color: #34d399;" onclick="runFullVideoNow()">
+              ⚡ Run in Background Now
+            </button>
+          </div>
+
+          <div class="progress-bar-wrap" id="jobProgressWrap">
+            <div class="progress-bar-fill" id="jobProgressFill"></div>
+          </div>
+          <div class="progress-text" id="jobProgressText">Starting job...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentRatio = "9:16";
+    let currentPosX = 0.5;
+    let videoWidth = 1920;
+    let videoHeight = 1080;
+    let activeJobId = null;
+
+    // Load available files on startup
+    window.addEventListener("DOMContentLoaded", () => {
+      scanFiles();
+      updateCropVisual();
+      generateCliCommand();
+    });
+
+    async function scanFiles() {
+      try {
+        const res = await fetch("/api/scan");
+        const data = await res.json();
+
+        populateSelect("videoSelect", data.videos, "Select Video File");
+        populateSelect("srtSelect", data.subtitles, "Select SRT Subtitle");
+        populateSelect("musicSelect", data.audios, "Select Background Music");
+
+        // Auto-select if known video exists (e.g. TRATAK)
+        const tratak = data.videos.find(v => v.name.includes("TRATAK") || v.name.includes(".mp4"));
+        if (tratak && !document.getElementById("videoPath").value) {
+          document.getElementById("videoSelect").value = tratak.path;
+          onSelectVideo(tratak.path);
+        }
+      } catch (err) {
+        console.error("Failed to scan local files:", err);
+      }
+    }
+
+    function populateSelect(elemId, items, placeholder) {
+      const sel = document.getElementById(elemId);
+      sel.innerHTML = `<option value="">-- ${placeholder} --</option>`;
+      items.forEach(it => {
+        const opt = document.createElement("option");
+        opt.value = it.path;
+        opt.textContent = `${it.name} (${it.folder})`;
+        sel.appendChild(opt);
+      });
+    }
+
+    function onSelectVideo(path) {
+      document.getElementById("videoPath").value = path;
+      probeCurrentVideo();
+      generateCliCommand();
+    }
+
+    async function probeCurrentVideo() {
+      const path = document.getElementById("videoPath").value.trim();
+      if (!path) return;
+
+      try {
+        const res = await fetch("/api/probe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path })
+        });
+        const data = await res.json();
+        if (data.success) {
+          videoWidth = data.width;
+          videoHeight = data.height;
+          document.getElementById("metaRes").textContent = `${data.width}x${data.height}`;
+          document.getElementById("metaDur").textContent = `Duration: ${data.duration_fmt}`;
+          document.getElementById("metaAudio").textContent = `Audio: ${data.has_audio ? 'Yes' : 'No'}`;
+          document.getElementById("videoMeta").style.display = "block";
+          updateCropVisual();
+          generateCliCommand();
+        }
+      } catch (e) {
+        console.warn("Probe failed", e);
+      }
+    }
+
+    function setRatio(ratio) {
+      currentRatio = ratio;
+      document.querySelectorAll(".ratio-btn").forEach(btn => {
+        btn.classList.toggle("active", btn.getAttribute("data-ratio") === ratio);
+      });
+      document.getElementById("posXContainer").style.display = (ratio === "original") ? "none" : "block";
+      updateCropVisual();
+      generateCliCommand();
+    }
+
+    function updateCropPosition(val) {
+      currentPosX = val / 100;
+      let label = "Center (50%)";
+      if (val < 45) label = `Left (${val}%)`;
+      else if (val > 55) label = `Right (${val}%)`;
+      document.getElementById("posXLabel").textContent = label;
+      updateCropVisual();
+      generateCliCommand();
+    }
+
+    function updateCropVisual() {
+      const cutout = document.getElementById("cutoutRep");
+      const canvas = document.getElementById("canvasRep");
+
+      let targetAspect = 9 / 16;
+      if (currentRatio === "1:1") targetAspect = 1.0;
+      else if (currentRatio === "4:5") targetAspect = 4 / 5;
+      else if (currentRatio === "original") targetAspect = 16 / 9;
+
+      const inAspect = videoWidth / videoHeight;
+      let cropW, cropH;
+
+      if (inAspect > targetAspect) {
+        cropH = videoHeight;
+        cropW = Math.round(videoHeight * targetAspect);
+      } else {
+        cropW = videoWidth;
+        cropH = Math.round(videoWidth / targetAspect);
+      }
+
+      cropW -= (cropW % 2);
+      cropH -= (cropH % 2);
+
+      const maxOffset = Math.max(0, videoWidth - cropW);
+      const offsetX = Math.round(maxOffset * currentPosX);
+
+      // Update simulation cutout
+      const widthPercent = (cropW / videoWidth) * 100;
+      const leftPercent = (offsetX / videoWidth) * 100;
+
+      cutout.style.width = `${widthPercent}%`;
+      cutout.style.left = `${leftPercent}%`;
+
+      document.getElementById("cropFilterLabel").textContent = `crop=${cropW}:${cropH}:${offsetX}:0`;
+    }
+
+    function updateMusicVolume(val) {
+      document.getElementById("volLabel").textContent = `${val}%`;
+      generateCliCommand();
+    }
+
+    function nudgePosX(delta) {
+      const s = document.getElementById("posXSlider");
+      s.value = Math.max(0, Math.min(100, parseInt(s.value) + delta));
+      updateCropPosition(s.value);
+    }
+
+    function nudgeVol(delta) {
+      const s = document.getElementById("volSlider");
+      s.value = Math.max(0, Math.min(50, parseInt(s.value) + delta));
+      updateMusicVolume(s.value);
+    }
+
+    function updateUIState() {
+      const subOn = document.getElementById("subEnable").checked;
+      const musicOn = document.getElementById("musicEnable").checked;
+      document.getElementById("subSection").style.opacity = subOn ? "1" : "0.4";
+      document.getElementById("musicSection").style.opacity = musicOn ? "1" : "0.4";
+      generateCliCommand();
+    }
+
+    function generateCliCommand() {
+      const video = document.getElementById("videoPath").value.trim() || "/path/to/video.mp4";
+      const out = video.replace(/\.mp4$/i, "") + `_${currentRatio.replace(":", "")}.mp4`;
+      const srt = document.getElementById("subEnable").checked ? document.getElementById("srtPath").value.trim() : "";
+      const music = document.getElementById("musicEnable").checked ? document.getElementById("musicPath").value.trim() : "";
+      const vol = (parseInt(document.getElementById("volSlider").value) / 100).toFixed(2);
+
+      let parts = [
+        "python3", "process_full.py",
+        `-v "${video}"`,
+        `-o "${out}"`,
+        `-r ${currentRatio}`,
+        `--pos-x ${currentPosX.toFixed(2)}`
+      ];
+
+      if (srt) parts.push(`-s "${srt}"`);
+      if (music) {
+        parts.push(`-m "${music}"`);
+        parts.push(`--volume ${vol}`);
+      }
+
+      const cmd = parts.join(" ");
+      document.getElementById("cliCommandBox").textContent = cmd;
+      return cmd;
+    }
+
+    function copyCommand() {
+      const cmd = document.getElementById("cliCommandBox").textContent;
+      navigator.clipboard.writeText(cmd).then(() => {
+        alert("Command copied to clipboard!");
+      });
+    }
+
+    async function generatePreview() {
+      const video = document.getElementById("videoPath").value.trim();
+      if (!video) {
+        alert("Please select or enter a video file path first.");
+        return;
+      }
+
+      const btn = document.getElementById("btnPreview");
+      const status = document.getElementById("previewStatus");
+      btn.disabled = true;
+      status.textContent = "⚡ Rendering 1-min preview with hardware acceleration...";
+
+      const srt = document.getElementById("subEnable").checked ? document.getElementById("srtPath").value.trim() : null;
+      const music = document.getElementById("musicEnable").checked ? document.getElementById("musicPath").value.trim() : null;
+      const vol = parseInt(document.getElementById("volSlider").value) / 100;
+      const start = parseFloat(document.getElementById("previewStart").value) || 0;
+      const color = document.getElementById("fontColor").value;
+      const size = parseInt(document.getElementById("fontSize").value);
+
+      try {
+        const res = await fetch("/api/preview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            video_path: video,
+            ratio: currentRatio,
+            pos_x: currentPosX,
+            srt_path: srt,
+            music_path: music,
+            music_volume: vol,
+            start_sec: start,
+            duration_sec: 60.0,
+            font_color: color,
+            font_size: size
+          })
+        });
+
+        const data = await res.json();
+        if (data.success) {
+          const v = document.getElementById("previewVideo");
+          v.src = data.preview_url;
+          v.style.display = "block";
+          document.getElementById("emptyPlayerText").style.display = "none";
+          v.play();
+          status.textContent = `✅ Ready (${data.crop_dimensions})`;
+        } else {
+          alert("Preview failed: " + data.error);
+          status.textContent = "Error";
+        }
+      } catch (err) {
+        alert("Network or server error: " + err);
+        status.textContent = "Error";
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function runFullVideoNow() {
+      const video = document.getElementById("videoPath").value.trim();
+      if (!video) {
+        alert("Please select a video file first.");
+        return;
+      }
+
+      const srt = document.getElementById("subEnable").checked ? document.getElementById("srtPath").value.trim() : null;
+      const music = document.getElementById("musicEnable").checked ? document.getElementById("musicPath").value.trim() : null;
+      const vol = parseInt(document.getElementById("volSlider").value) / 100;
+
+      const pWrap = document.getElementById("jobProgressWrap");
+      const pText = document.getElementById("jobProgressText");
+      pWrap.style.display = "block";
+      pText.style.display = "block";
+      pText.textContent = "Launching background hardware encoder...";
+
+      const res = await fetch("/api/run-full", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          video_path: video,
+          ratio: currentRatio,
+          pos_x: currentPosX,
+          srt_path: srt,
+          music_path: music,
+          music_volume: vol
+        })
+      });
+
+      const data = await res.json();
+      activeJobId = data.job_id;
+      pollJobStatus();
+    }
+
+    function pollJobStatus() {
+      if (!activeJobId) return;
+      const interval = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/job-status/${activeJobId}`);
+          const job = await res.json();
+          const pText = document.getElementById("jobProgressText");
+          const pFill = document.getElementById("jobProgressFill");
+
+          if (job.status === "running") {
+            pFill.style.width = "75%";
+            pText.textContent = `🚀 Processing: ${job.progress}`;
+          } else if (job.status === "completed") {
+            clearInterval(interval);
+            pFill.style.width = "100%";
+            pText.textContent = `✅ Completed! Saved to: ${job.output_path}`;
+          } else if (job.status === "failed") {
+            clearInterval(interval);
+            pText.textContent = `❌ Error: ${job.error}`;
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      }, 1000);
+    }
+
+    // Disable mousewheel changing sliders on scroll
+    document.querySelectorAll('input[type="range"]').forEach(input => {
+      input.addEventListener('wheel', e => e.preventDefault(), { passive: false });
+    });
+
+    // Hold and drag on canvasRep to reposition crop framing
+    const canvasRep = document.getElementById("canvasRep");
+    if (canvasRep) {
+      let isDragging = false;
+      let startX = 0;
+      let startPosVal = 50;
+
+      canvasRep.style.cursor = "grab";
+      canvasRep.addEventListener("mousedown", (e) => {
+        isDragging = true;
+        startX = e.clientX;
+        startPosVal = parseInt(document.getElementById("posXSlider").value) || 50;
+        canvasRep.style.cursor = "grabbing";
+        e.preventDefault();
+      });
+
+      window.addEventListener("mousemove", (e) => {
+        if (!isDragging) return;
+        const rect = canvasRep.getBoundingClientRect();
+        const dx = e.clientX - startX;
+        const deltaPct = (dx / (rect.width || 1)) * 100;
+        const newVal = Math.max(0, Math.min(100, Math.round(startPosVal + deltaPct)));
+        const slider = document.getElementById("posXSlider");
+        slider.value = newVal;
+        updateCropPosition(newVal);
+      });
+
+      window.addEventListener("mouseup", () => {
+        if (isDragging) {
+          isDragging = false;
+          canvasRep.style.cursor = "grab";
+        }
+      });
+    }
+  </script>
+</body>
+</html>

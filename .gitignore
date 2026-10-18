@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Temporary files
+.temp_raw_frame.jpg
+*.tmp
+*.temp
+
+# Video, audio & output files
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.mp3
+*.wav
+*.aac
+*.flac
+
+# Generated directories
+/offline_previews/*
+!/offline_previews/.gitkeep
+/approved_clips/*
+!/approved_clips/.gitkeep
+/static_previews/*
+!/static_previews/.gitkeep
