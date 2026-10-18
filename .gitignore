@@ -32,10 +32,11 @@ env/
 *.aac
 *.flac
 
-# Generated directories
+# Generated directories & assets
 /offline_previews/*
 !/offline_previews/.gitkeep
 /approved_clips/*
 !/approved_clips/.gitkeep
 /static_previews/*
 !/static_previews/.gitkeep
+assets/bottom_fade_*x*.png

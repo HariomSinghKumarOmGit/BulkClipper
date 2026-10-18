@@ -94,7 +94,9 @@ def run_folder_system(
     scale: float = 1.0,
     pos_x: float = 0.5,
     pos_y: float = 0.5,
-    bottom_fade: bool = True
+    bottom_fade: bool = True,
+    pad_top: float = 0.0,
+    pad_bottom: float = 0.0
 ):
     folder = Path(folder_path_str).resolve()
     if not folder.exists() or not folder.is_dir():
@@ -148,14 +150,16 @@ def run_folder_system(
         ratio=ratio,
         pos_x=pos_x,
         pos_y=pos_y,
-        scale=scale
+        scale=scale,
+        pad_top=pad_top,
+        pad_bottom=pad_bottom
     )
     if abs(in_aspect - (16.0 / 9.0)) < 0.02:
         yt_crop_filter = None
     else:
         yt_crop_filter, _, _, _, _ = compute_crop_filter(in_w=in_w, in_h=in_h, ratio="16:9", pos_x=0.5, pos_y=0.5, scale=1.0)
 
-    print(f"📐 Shorts Crop (≤3m): {ratio} ({crop_w}x{crop_h}) [Scale: {scale:.2f}x, Pos: ({pos_x:.2f}, {pos_y:.2f})]")
+    print(f"📐 Shorts Crop (≤3m): {ratio} ({crop_w}x{crop_h}) [Scale: {scale:.2f}x, Pos: ({pos_x:.2f}, {pos_y:.2f}), Pad: (T:{pad_top:.1f}%, B:{pad_bottom:.1f}%)]")
     print(f"📐 Long Video (>3m) : 16:9 Original (Unscaled YouTube format)")
     print(f"🖤 Bottom Black Fade: {'Enabled' if bottom_fade else 'Disabled'}")
     print(f"📁 Destination      : {out_dir}")

@@ -60,10 +60,13 @@ class StudioClipperApp(ctk.CTk):
         self.current_scale = 1.0
         self.current_pos_x = 0.5
         self.current_pos_y = 0.5
+        self.current_pad_top = 0.0
+        self.current_pad_bottom = 0.0
         self.current_vol = 0.12
         self.bottom_fade_var = ctk.BooleanVar(value=True)
         self.fade_height = 0.38
         self.fade_opacity = 0.92
+        self.preview_mode = "reel"
         self.is_rendering = False
         self.is_cancelled = False
         self.current_proc = None
@@ -343,7 +346,100 @@ class StudioClipperApp(ctk.CTk):
         self._attach_button_repeat(self.btn_pos_y_plus, self._pos_y_step_plus)
         self._disable_slider_scroll(self.pos_y_slider, self.left_frame)
 
-        # --- D. Bottom Black Fade (Caption Contrast) Switch ---
+        # --- D. Frame Padding (Shift Clip Up / Letterbox) ---
+        pad_header_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_header_frame.pack(fill="x", pady=(0, 2))
+
+        ctk.CTkLabel(
+            pad_header_frame,
+            text="Frame Padding (Shift Clip Up / Letterbox):",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).pack(side="left")
+
+        # Quick Preset Buttons:
+        pad_preset_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_preset_frame.pack(fill="x", pady=(2, 8))
+
+        self.btn_preset_shifted = ctk.CTkButton(
+            pad_preset_frame,
+            text="🎬 Shift Up (8% / 14%)",
+            height=26,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#4338ca",
+            hover_color="#3730a3",
+            command=self._preset_shifted_pad
+        )
+        self.btn_preset_shifted.pack(side="left", padx=(0, 4), expand=True, fill="x")
+
+        self.btn_preset_centered = ctk.CTkButton(
+            pad_preset_frame,
+            text="↕️ Centered (10% / 10%)",
+            height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color="#374151",
+            hover_color="#4b5563",
+            command=self._preset_centered_pad
+        )
+        self.btn_preset_centered.pack(side="left", padx=2, expand=True, fill="x")
+
+        self.btn_preset_zero = ctk.CTkButton(
+            pad_preset_frame,
+            text="Full (0%)",
+            height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color="#374151",
+            hover_color="#4b5563",
+            command=self._reset_padding
+        )
+        self.btn_preset_zero.pack(side="left", padx=(4, 0), expand=True, fill="x")
+
+        # Top Padding Slider with - / + buttons
+        pad_top_subhead = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_top_subhead.pack(fill="x", pady=(0, 2))
+        self.pad_top_label_var = ctk.StringVar(value="Top Padding: 0%")
+        ctk.CTkLabel(pad_top_subhead, textvariable=self.pad_top_label_var, font=ctk.CTkFont(size=11)).pack(side="left")
+
+        pad_top_ctrl = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_top_ctrl.pack(fill="x", pady=(0, 8))
+
+        self.btn_pad_top_minus = ctk.CTkButton(pad_top_ctrl, text="-", width=32, height=26, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_pad_top_minus.pack(side="left", padx=(0, 6))
+
+        self.pad_top_slider = ctk.CTkSlider(pad_top_ctrl, from_=0.0, to=30.0, number_of_steps=60, command=self._on_pad_top_slider_changed)
+        self.pad_top_slider.set(0.0)
+        self.pad_top_slider.pack(side="left", fill="x", expand=True)
+
+        self.btn_pad_top_plus = ctk.CTkButton(pad_top_ctrl, text="+", width=32, height=26, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_pad_top_plus.pack(side="right", padx=(6, 0))
+
+        self._attach_button_repeat(self.btn_pad_top_minus, self._pad_top_step_minus)
+        self._attach_button_repeat(self.btn_pad_top_plus, self._pad_top_step_plus)
+        self._disable_slider_scroll(self.pad_top_slider, self.left_frame)
+
+        # Bottom Padding Slider with - / + buttons
+        pad_bottom_subhead = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_bottom_subhead.pack(fill="x", pady=(0, 2))
+        self.pad_bottom_label_var = ctk.StringVar(value="Bottom Padding: 0%")
+        ctk.CTkLabel(pad_bottom_subhead, textvariable=self.pad_bottom_label_var, font=ctk.CTkFont(size=11)).pack(side="left")
+
+        pad_bottom_ctrl = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_bottom_ctrl.pack(fill="x", pady=(0, 10))
+
+        self.btn_pad_bottom_minus = ctk.CTkButton(pad_bottom_ctrl, text="-", width=32, height=26, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_pad_bottom_minus.pack(side="left", padx=(0, 6))
+
+        self.pad_bottom_slider = ctk.CTkSlider(pad_bottom_ctrl, from_=0.0, to=40.0, number_of_steps=80, command=self._on_pad_bottom_slider_changed)
+        self.pad_bottom_slider.set(0.0)
+        self.pad_bottom_slider.pack(side="left", fill="x", expand=True)
+
+        self.btn_pad_bottom_plus = ctk.CTkButton(pad_bottom_ctrl, text="+", width=32, height=26, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_pad_bottom_plus.pack(side="right", padx=(6, 0))
+
+        self._attach_button_repeat(self.btn_pad_bottom_minus, self._pad_bottom_step_minus)
+        self._attach_button_repeat(self.btn_pad_bottom_plus, self._pad_bottom_step_plus)
+        self._disable_slider_scroll(self.pad_bottom_slider, self.left_frame)
+
+        # --- E. Bottom Black Fade (Caption Contrast) Switch ---
         fade_box = ctk.CTkFrame(self.left_frame, fg_color="#182030", border_width=1, border_color="#374151", corner_radius=8)
         fade_box.pack(fill="x", pady=(0, 14))
 
@@ -408,6 +504,15 @@ class StudioClipperApp(ctk.CTk):
         )
         self.size_menu.set("Medium (22pt)")
         self.size_menu.pack(side="left")
+
+        # Caption Vertical Placement (Above Padding on Video vs Bottom Black Bar)
+        self.caption_pos_menu = ctk.CTkOptionMenu(
+            self.left_frame,
+            values=["Caption: On Video Fade (Above Padding)", "Caption: Inside Black Bottom Bar"],
+            command=lambda _: (self._render_visual_crop(), self._update_cli_display())
+        )
+        self.caption_pos_menu.set("Caption: On Video Fade (Above Padding)")
+        self.caption_pos_menu.pack(fill="x", pady=(0, 14))
 
         # 4. Background Music & Ducking
         self._create_section_label(self.left_frame, "4. Background Music & Ducking (.mp3, .wav)")
@@ -510,6 +615,17 @@ class StudioClipperApp(ctk.CTk):
 
         # --- TAB 1: PREVIEW & HEADLESS WHOLE VIDEO ---
         self._create_section_label(self.tab_preview, "Visual Crop Framing (Live Preview)")
+
+        preview_mode_frame = ctk.CTkFrame(self.tab_preview, fg_color="transparent")
+        preview_mode_frame.pack(fill="x", padx=10, pady=(0, 6))
+
+        self.preview_mode_segmented = ctk.CTkSegmentedButton(
+            preview_mode_frame,
+            values=["📱 Final Reel View (9:16)", "📐 16:9 Source Cutout"],
+            command=self._on_preview_mode_changed
+        )
+        self.preview_mode_segmented.set("📱 Final Reel View (9:16)")
+        self.preview_mode_segmented.pack(side="left")
 
         self.canvas_label = ctk.CTkLabel(
             self.tab_preview,
@@ -874,6 +990,78 @@ class StudioClipperApp(ctk.CTk):
         self.pos_y_slider.set(0.5)
         self._on_pos_y_slider_changed(0.5)
 
+    def _preset_shifted_pad(self):
+        """Sets top padding to 8% and bottom padding to 14% to shift clip upward like reference Reel."""
+        self.current_pad_top = 8.0
+        self.current_pad_bottom = 14.0
+        self.pad_top_slider.set(8.0)
+        self.pad_bottom_slider.set(14.0)
+        self.pad_top_label_var.set("Top Padding: 8.0% (Shifted Up)")
+        self.pad_bottom_label_var.set("Bottom Padding: 14.0% (Letterbox)")
+        self._render_visual_crop()
+        self._update_cli_display()
+
+    def _preset_centered_pad(self):
+        """Sets balanced 10% top and 10% bottom padding."""
+        self.current_pad_top = 10.0
+        self.current_pad_bottom = 10.0
+        self.pad_top_slider.set(10.0)
+        self.pad_bottom_slider.set(10.0)
+        self.pad_top_label_var.set("Top Padding: 10.0%")
+        self.pad_bottom_label_var.set("Bottom Padding: 10.0%")
+        self._render_visual_crop()
+        self._update_cli_display()
+
+    def _reset_padding(self):
+        """Resets padding to 0%."""
+        self.current_pad_top = 0.0
+        self.current_pad_bottom = 0.0
+        self.pad_top_slider.set(0.0)
+        self.pad_bottom_slider.set(0.0)
+        self.pad_top_label_var.set("Top Padding: 0%")
+        self.pad_bottom_label_var.set("Bottom Padding: 0%")
+        self._render_visual_crop()
+        self._update_cli_display()
+
+    def _on_pad_top_slider_changed(self, value: float):
+        self.current_pad_top = round(float(value), 1)
+        self.pad_top_label_var.set(f"Top Padding: {self.current_pad_top:.1f}%")
+        self._render_visual_crop()
+        self._update_cli_display()
+
+    def _on_pad_bottom_slider_changed(self, value: float):
+        self.current_pad_bottom = round(float(value), 1)
+        self.pad_bottom_label_var.set(f"Bottom Padding: {self.current_pad_bottom:.1f}%")
+        self._render_visual_crop()
+        self._update_cli_display()
+
+    def _pad_top_step_minus(self):
+        val = max(0.0, round(self.current_pad_top - 1.0, 1))
+        self.pad_top_slider.set(val)
+        self._on_pad_top_slider_changed(val)
+
+    def _pad_top_step_plus(self):
+        val = min(30.0, round(self.current_pad_top + 1.0, 1))
+        self.pad_top_slider.set(val)
+        self._on_pad_top_slider_changed(val)
+
+    def _pad_bottom_step_minus(self):
+        val = max(0.0, round(self.current_pad_bottom - 1.0, 1))
+        self.pad_bottom_slider.set(val)
+        self._on_pad_bottom_slider_changed(val)
+
+    def _pad_bottom_step_plus(self):
+        val = min(40.0, round(self.current_pad_bottom + 1.0, 1))
+        self.pad_bottom_slider.set(val)
+        self._on_pad_bottom_slider_changed(val)
+
+    def _on_preview_mode_changed(self, mode: str):
+        if "Reel" in mode:
+            self.preview_mode = "reel"
+        else:
+            self.preview_mode = "source"
+        self._render_visual_crop()
+
     def _on_fade_switch_changed(self):
         self._render_visual_crop()
         self._update_cli_display()
@@ -975,35 +1163,48 @@ class StudioClipperApp(ctk.CTk):
         if not self.video_info or not hasattr(self, "_preview_geom"):
             return
         geom = self._preview_geom
+        mode = geom.get("mode", "reel")
         in_w = geom["in_w"]
         in_h = geom["in_h"]
         crop_w = geom["crop_w"]
         crop_h = geom["crop_h"]
-        target_w = geom["target_w"]
-        target_h = geom["target_h"]
 
-        scale_x = target_w / in_w
-        scale_y = target_h / in_h
-
-        # Horizontal travel
-        max_travel_px_x = (in_w - crop_w) * scale_x
-        if max_travel_px_x > 0:
+        if mode == "reel":
             dx = event.x - self._drag_start_x
-            d_pos_x = dx / max_travel_px_x
+            dy = event.y - self._drag_start_y
+            d_pos_x = -dx / 120.0
+            d_pos_y = -dy / 120.0
             new_pos_x = max(0.0, min(1.0, round(self._drag_start_pos_x + d_pos_x, 3)))
+            new_pos_y = max(0.0, min(1.0, round(self._drag_start_pos_y + d_pos_y, 3)))
             if new_pos_x != self.current_pos_x:
                 self.pos_slider.set(new_pos_x)
                 self._on_pos_slider_changed(new_pos_x, refresh=False)
-
-        # Vertical travel
-        max_travel_px_y = (in_h - crop_h) * scale_y
-        if max_travel_px_y > 0:
-            dy = event.y - self._drag_start_y
-            d_pos_y = dy / max_travel_px_y
-            new_pos_y = max(0.0, min(1.0, round(self._drag_start_pos_y + d_pos_y, 3)))
             if new_pos_y != self.current_pos_y:
                 self.pos_y_slider.set(new_pos_y)
                 self._on_pos_y_slider_changed(new_pos_y, refresh=False)
+        else:
+            target_w = geom.get("target_w", 480)
+            target_h = geom.get("target_h", 260)
+            scale_x = target_w / in_w
+            scale_y = target_h / in_h
+
+            max_travel_px_x = (in_w - crop_w) * scale_x
+            if max_travel_px_x > 0:
+                dx = event.x - self._drag_start_x
+                d_pos_x = dx / max_travel_px_x
+                new_pos_x = max(0.0, min(1.0, round(self._drag_start_pos_x + d_pos_x, 3)))
+                if new_pos_x != self.current_pos_x:
+                    self.pos_slider.set(new_pos_x)
+                    self._on_pos_slider_changed(new_pos_x, refresh=False)
+
+            max_travel_px_y = (in_h - crop_h) * scale_y
+            if max_travel_px_y > 0:
+                dy = event.y - self._drag_start_y
+                d_pos_y = dy / max_travel_px_y
+                new_pos_y = max(0.0, min(1.0, round(self._drag_start_pos_y + d_pos_y, 3)))
+                if new_pos_y != self.current_pos_y:
+                    self.pos_y_slider.set(new_pos_y)
+                    self._on_pos_y_slider_changed(new_pos_y, refresh=False)
 
         self._render_visual_crop()
         self._update_cli_display()
@@ -1067,7 +1268,7 @@ class StudioClipperApp(ctk.CTk):
         self._update_cli_display()
 
     def _render_visual_crop(self):
-        """Draws visual crop cutout dynamically on top of the video frame image."""
+        """Draws visual crop dynamically either as 9:16 Final Reel View or 16:9 Source Cutout View."""
         if not self.video_info:
             return
 
@@ -1080,101 +1281,182 @@ class StudioClipperApp(ctk.CTk):
             ratio=self.current_ratio,
             pos_x=self.current_pos_x,
             pos_y=self.current_pos_y,
-            scale=self.current_scale
+            scale=self.current_scale,
+            pad_top=self.current_pad_top,
+            pad_bottom=self.current_pad_bottom
         )
 
         fade_status = "ON (🖤)" if self.bottom_fade_var.get() else "OFF"
+        pad_status = f"Pad: T:{self.current_pad_top:.1f}% B:{self.current_pad_bottom:.1f}%"
         self.filter_info_label.configure(
-            text=f"FFmpeg: {crop_filter}\nFraming: Scale {self.current_scale:.2f}x | X {int(self.current_pos_x*100)}% | Y {int(self.current_pos_y*100)}% | Fade: {fade_status}"
+            text=f"FFmpeg: {crop_filter}\nFraming: Scale {self.current_scale:.2f}x | X {int(self.current_pos_x*100)}% | Y {int(self.current_pos_y*100)}% | {pad_status} | Fade: {fade_status}"
         )
 
-        # Draw on image preview
         target_display_w = 480
-        target_display_h = int(target_display_w * (in_h / in_w))
-        if target_display_h > 260:
-            target_display_h = 260
-            target_display_w = int(target_display_h * (in_w / in_h))
+        target_display_h = 260
 
-        # Save geometry for direct mouse dragging
-        self._preview_geom = {
-            "in_w": in_w,
-            "in_h": in_h,
-            "crop_w": crop_w,
-            "crop_h": crop_h,
-            "target_w": target_display_w,
-            "target_h": target_display_h
-        }
+        if self.preview_mode == "reel":
+            # --- 📱 9:16 FINAL REEL PREVIEW ---
+            bg = Image.new("RGBA", (target_display_w, target_display_h), (18, 22, 32, 255))
+            d_bg = ImageDraw.Draw(bg)
 
-        if self.base_frame_image:
-            img = self.base_frame_image.copy().resize((target_display_w, target_display_h), Image.Resampling.LANCZOS)
-        else:
-            img = Image.new("RGB", (target_display_w, target_display_h), color=(20, 24, 34))
+            reel_h = 256
+            reel_w = int(reel_h * (9 / 16))
+            rx1 = (target_display_w - reel_w) // 2
+            rx2 = rx1 + reel_w
+            ry1 = 2
+            ry2 = ry1 + reel_h
 
-        # Create overlay darkening outside crop
-        scale_x = target_display_w / in_w
-        scale_y = target_display_h / in_h
+            pad_t_px = int(round(reel_h * (self.current_pad_top / 100.0)))
+            pad_b_px = int(round(reel_h * (self.current_pad_bottom / 100.0)))
+            vid_disp_h = max(32, reel_h - pad_t_px - pad_b_px)
 
-        box_x1 = int(off_x * scale_x)
-        box_y1 = int(off_y * scale_y)
-        box_x2 = int((off_x + crop_w) * scale_x)
-        box_y2 = int((off_y + crop_h) * scale_y)
+            self._preview_geom = {
+                "mode": "reel",
+                "in_w": in_w,
+                "in_h": in_h,
+                "crop_w": crop_w,
+                "crop_h": crop_h,
+                "rx1": rx1,
+                "rx2": rx2,
+                "ry1": ry1,
+                "ry2": ry2,
+                "target_w": reel_w,
+                "target_h": reel_h
+            }
 
-        # Semi-transparent dark mask
-        mask = Image.new("RGBA", (target_display_w, target_display_h), (0, 0, 0, 160))
-        draw_mask = ImageDraw.Draw(mask)
-        # Clear inside crop area
-        draw_mask.rectangle([box_x1, box_y1, box_x2, box_y2], fill=(0, 0, 0, 0))
+            d_bg.rectangle([rx1, ry1, rx2, ry2], fill=(0, 0, 0, 255))
 
-        img_rgba = img.convert("RGBA")
-        img_composite = Image.alpha_composite(img_rgba, mask)
+            if self.base_frame_image:
+                crop_box = (off_x, off_y, off_x + crop_w, off_y + crop_h)
+                try:
+                    cropped_frame = self.base_frame_image.crop(crop_box).resize((reel_w, vid_disp_h), Image.Resampling.LANCZOS)
+                except Exception:
+                    cropped_frame = self.base_frame_image.resize((reel_w, vid_disp_h), Image.Resampling.LANCZOS)
+            else:
+                cropped_frame = Image.new("RGBA", (reel_w, vid_disp_h), (40, 50, 70, 255))
 
-        # Draw bottom black fade inside crop box if enabled
-        if self.bottom_fade_var.get() and (box_y2 > box_y1) and (box_x2 > box_x1):
-            box_h = box_y2 - box_y1
-            fade_h = max(4, int(box_h * self.fade_height))
-            fade_top = max(box_y1, box_y2 - fade_h)
-            actual_fade_h = box_y2 - fade_top
-            
-            fade_col = Image.new("RGBA", (1, actual_fade_h), (0, 0, 0, 0))
-            col_put = fade_col.putpixel
-            for y_idx in range(actual_fade_h):
-                norm = y_idx / max(1, actual_fade_h - 1)
-                alpha = int(255 * self.fade_opacity * (norm ** 1.35))
-                col_put((0, y_idx), (0, 0, 0, min(255, max(0, alpha))))
-            
-            fade_box = fade_col.resize((box_x2 - box_x1, actual_fade_h), Image.Resampling.NEAREST)
-            img_composite.paste(fade_box, (box_x1, fade_top), fade_box)
+            bg.paste(cropped_frame, (rx1, ry1 + pad_t_px))
+
+            # Draw bottom black fade gradient if enabled
+            if self.bottom_fade_var.get() and vid_disp_h > 20:
+                fade_h = max(6, int(vid_disp_h * self.fade_height))
+                fade_top = vid_disp_h - fade_h
+                col = Image.new("RGBA", (1, fade_h), (0, 0, 0, 0))
+                for y_idx in range(fade_h):
+                    norm = y_idx / max(1, fade_h - 1)
+                    alpha = int(255 * self.fade_opacity * (norm ** 1.35))
+                    col.putpixel((0, y_idx), (0, 0, 0, min(255, max(0, alpha))))
+                fade_img = col.resize((reel_w, fade_h), Image.Resampling.NEAREST)
+                bg.paste(fade_img, (rx1, ry1 + pad_t_px + fade_top), fade_img)
 
             # Draw sample caption text on preview
-            if box_h > 45 and (box_x2 - box_x1) > 70:
-                draw_cap = ImageDraw.Draw(img_composite)
-                sample_text = "सिद्धि तो है। हम बढ़ रहे हैं"
+            draw_cap = ImageDraw.Draw(bg)
+            sample_text = "सिद्धि तो है। हम बढ़ रहे हैं"
+            try:
+                cap_font = ImageFont.truetype("/System/Library/Fonts/Kohinoor.ttc", 13)
+            except Exception:
                 try:
-                    cap_font = ImageFont.truetype("/System/Library/Fonts/Kohinoor.ttc", 13)
+                    cap_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 12)
                 except Exception:
-                    try:
-                        cap_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 12)
-                    except Exception:
-                        cap_font = ImageFont.load_default()
+                    cap_font = ImageFont.load_default()
 
-                try:
-                    bbox = draw_cap.textbbox((0, 0), sample_text, font=cap_font)
-                    tw = bbox[2] - bbox[0]
-                except Exception:
-                    tw = len(sample_text) * 7
-                
-                tx = max(box_x1 + 4, int((box_x1 + box_x2 - tw) / 2))
-                ty = box_y2 - max(12, int(box_h * 0.12))
-                # Text black outline
-                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
-                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
-                # Primary text color
-                txt_color = (255, 255, 0, 255) if "Yellow" in self.color_menu.get() else (255, 255, 255, 255)
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=txt_color)
+            try:
+                bbox = draw_cap.textbbox((0, 0), sample_text, font=cap_font)
+                tw = bbox[2] - bbox[0]
+            except Exception:
+                tw = len(sample_text) * 7
 
-        # Draw glowing crop border
-        draw_box = ImageDraw.Draw(img_composite)
-        draw_box.rectangle([box_x1, box_y1, box_x2, box_y2], outline=(99, 102, 241, 255), width=3)
+            tx = rx1 + max(2, (reel_w - tw) // 2)
+            in_black_bar = hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()
+            if in_black_bar and pad_b_px > 16:
+                ty = ry1 + reel_h - max(12, int(pad_b_px / 2) + 6)
+            else:
+                ty = ry1 + pad_t_px + vid_disp_h - max(12, int(vid_disp_h * 0.12))
+
+            for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
+                draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
+            txt_color = (255, 255, 0, 255) if "Yellow" in self.color_menu.get() else (255, 255, 255, 255)
+            draw_cap.text((tx, ty), sample_text, font=cap_font, fill=txt_color)
+
+            # Glowing Reel border
+            d_bg.rectangle([rx1, ry1, rx2, ry2], outline=(99, 102, 241, 255), width=2)
+
+            # Draw side annotations
+            try:
+                side_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 11)
+            except Exception:
+                side_font = ImageFont.load_default()
+
+            d_bg.text((12, 40), "📱 9:16 Final Reel", font=side_font, fill=(165, 180, 252, 255))
+            d_bg.text((12, 65), f"Top Pad: {self.current_pad_top:.1f}%", font=side_font, fill=(148, 163, 184, 255))
+            d_bg.text((12, 85), f"Bottom Pad: {self.current_pad_bottom:.1f}%", font=side_font, fill=(148, 163, 184, 255))
+            if self.current_pad_bottom > self.current_pad_top:
+                d_bg.text((12, 115), "⬆️ Shifted Upward", font=side_font, fill=(52, 211, 153, 255))
+            elif self.current_pad_top == 0 and self.current_pad_bottom == 0:
+                d_bg.text((12, 115), "↔️ Full Screen 9:16", font=side_font, fill=(148, 163, 184, 255))
+
+            rx_info = rx2 + 16
+            d_bg.text((rx_info, 40), f"Zoom: {self.current_scale:.2f}x", font=side_font, fill=(165, 180, 252, 255))
+            d_bg.text((rx_info, 65), f"Pan X: {int(self.current_pos_x*100)}%", font=side_font, fill=(148, 163, 184, 255))
+            d_bg.text((rx_info, 85), f"Pan Y: {int(self.current_pos_y*100)}%", font=side_font, fill=(148, 163, 184, 255))
+            d_bg.text((rx_info, 115), f"Fade: {fade_status}", font=side_font, fill=(96, 165, 250, 255) if self.bottom_fade_var.get() else (148, 163, 184, 255))
+
+            img_composite = bg.convert("RGB")
+        else:
+            # --- 📐 16:9 SOURCE CUTOUT VIEW ---
+            disp_h = int(target_display_w * (in_h / in_w))
+            if disp_h > 260:
+                disp_h = 260
+                disp_w = int(disp_h * (in_w / in_h))
+            else:
+                disp_w = target_display_w
+
+            self._preview_geom = {
+                "mode": "source",
+                "in_w": in_w,
+                "in_h": in_h,
+                "crop_w": crop_w,
+                "crop_h": crop_h,
+                "target_w": disp_w,
+                "target_h": disp_h
+            }
+
+            if self.base_frame_image:
+                img = self.base_frame_image.copy().resize((disp_w, disp_h), Image.Resampling.LANCZOS)
+            else:
+                img = Image.new("RGB", (disp_w, disp_h), color=(20, 24, 34))
+
+            scale_x = disp_w / in_w
+            scale_y = disp_h / in_h
+
+            box_x1 = int(off_x * scale_x)
+            box_y1 = int(off_y * scale_y)
+            box_x2 = int((off_x + crop_w) * scale_x)
+            box_y2 = int((off_y + crop_h) * scale_y)
+
+            mask = Image.new("RGBA", (disp_w, disp_h), (0, 0, 0, 160))
+            draw_mask = ImageDraw.Draw(mask)
+            draw_mask.rectangle([box_x1, box_y1, box_x2, box_y2], fill=(0, 0, 0, 0))
+
+            img_rgba = img.convert("RGBA")
+            img_composite = Image.alpha_composite(img_rgba, mask)
+
+            if self.bottom_fade_var.get() and (box_y2 > box_y1) and (box_x2 > box_x1):
+                box_h = box_y2 - box_y1
+                fade_h = max(4, int(box_h * self.fade_height))
+                fade_top = max(box_y1, box_y2 - fade_h)
+                actual_fade_h = box_y2 - fade_top
+                fade_col = Image.new("RGBA", (1, actual_fade_h), (0, 0, 0, 0))
+                for y_idx in range(actual_fade_h):
+                    norm = y_idx / max(1, actual_fade_h - 1)
+                    alpha = int(255 * self.fade_opacity * (norm ** 1.35))
+                    fade_col.putpixel((0, y_idx), (0, 0, 0, min(255, max(0, alpha))))
+                fade_box = fade_col.resize((box_x2 - box_x1, actual_fade_h), Image.Resampling.NEAREST)
+                img_composite.paste(fade_box, (box_x1, fade_top), fade_box)
+
+            draw_box = ImageDraw.Draw(img_composite)
+            draw_box.rectangle([box_x1, box_y1, box_x2, box_y2], outline=(99, 102, 241, 255), width=3)
 
         ctk_img = ctk.CTkImage(light_image=img_composite, dark_image=img_composite, size=(target_display_w, target_display_h))
         self.canvas_label.configure(image=ctk_img, text="", cursor="hand2")
@@ -1198,6 +1480,11 @@ class StudioClipperApp(ctk.CTk):
             f'--pos-y {self.current_pos_y:.2f}'
         ]
 
+        if self.current_pad_top > 0:
+            parts.append(f'--pad-top {self.current_pad_top:.1f}')
+        if self.current_pad_bottom > 0:
+            parts.append(f'--pad-bottom {self.current_pad_bottom:.1f}')
+
         if self.bottom_fade_var.get():
             parts.append('--bottom-fade')
 
@@ -1208,6 +1495,8 @@ class StudioClipperApp(ctk.CTk):
             parts.append(f'--font-size {f_size}')
             if "Yellow" in self.color_menu.get():
                 parts.append('--font-color "&H0000FFFF"')
+            if hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get():
+                parts.append('--sub-margin 35')
 
         music = self.music_entry.get().strip()
         if self.music_switch_var.get() and music and os.path.exists(music):
@@ -1257,7 +1546,9 @@ class StudioClipperApp(ctk.CTk):
                 ratio=self.current_ratio,
                 pos_x=self.current_pos_x,
                 pos_y=self.current_pos_y,
-                scale=self.current_scale
+                scale=self.current_scale,
+                pad_top=self.current_pad_top,
+                pad_bottom=self.current_pad_bottom
             )
 
             srt = self.srt_entry.get().strip()
@@ -1268,6 +1559,7 @@ class StudioClipperApp(ctk.CTk):
 
             font_col = "&H0000FFFF" if "Yellow" in self.color_menu.get() else "&H00FFFFFF"
             font_sz = self._get_selected_font_size()
+            sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
 
             run_pipeline(
                 video_path=self.video_path,
@@ -1283,7 +1575,8 @@ class StudioClipperApp(ctk.CTk):
                 font_size=font_sz,
                 bottom_fade=self.bottom_fade_var.get(),
                 fade_height=self.fade_height,
-                fade_opacity=self.fade_opacity
+                fade_opacity=self.fade_opacity,
+                sub_margin_v=sub_marg
             )
 
             preview_path = preview_file
@@ -1569,7 +1862,9 @@ class StudioClipperApp(ctk.CTk):
                 ratio=self.current_ratio,
                 pos_x=self.current_pos_x,
                 pos_y=self.current_pos_y,
-                scale=self.current_scale
+                scale=self.current_scale,
+                pad_top=self.current_pad_top,
+                pad_bottom=self.current_pad_bottom
             )
 
             # For long clips > 3 min: keep 16:9 unscaled original video (YouTube friendly)
@@ -1592,6 +1887,7 @@ class StudioClipperApp(ctk.CTk):
             use_music = self.music_switch_var.get() and music and os.path.exists(music)
             font_col = "&H0000FFFF" if "Yellow" in self.color_menu.get() else "&H00FFFFFF"
             font_sz = self._get_selected_font_size()
+            sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
 
             total = len(entries)
             thumb_dir = out_dir / "thumbnails"
@@ -1654,9 +1950,10 @@ class StudioClipperApp(ctk.CTk):
                     use_hw_accel=True,
                     font_color=font_col,
                     font_size=font_sz,
-                    bottom_fade=self.bottom_fade_var.get(),
+                    bottom_fade=self.bottom_fade_var.get() and not is_long,
                     fade_height=self.fade_height,
                     fade_opacity=self.fade_opacity,
+                    sub_margin_v=sub_marg,
                     cancel_check=check_cancel,
                     proc_callback=set_proc
                 )
