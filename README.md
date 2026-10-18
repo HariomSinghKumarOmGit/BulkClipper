@@ -1,5 +1,8 @@
 # Studio Video Clipper & Hardware Cropper (Offline Mac Desktop App)
 
+## clone repo, double click on launch clipper.command 
+### i will try to make a video explaening it 
+
 A 100% offline, native macOS desktop application for selecting local videos, visual aspect-ratio cropping (9:16 Shorts/Reels, 1:1, 4:5), subtitle burning, background music ducking, and 1-minute previews—powered by Apple Silicon Media Engine (`h264_videotoolbox`) hardware acceleration.
 
 ---
