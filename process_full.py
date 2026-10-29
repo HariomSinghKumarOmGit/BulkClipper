@@ -65,6 +65,120 @@ ASSETS_DIR = BASE_DIR / "assets"
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# ==============================================================
+# MODERN VIRAL CAPTION / SUBTITLE STYLES PRESETS
+# ==============================================================
+CAPTION_STYLES: Dict[str, Dict[str, Any]] = {
+    "✨ Soothe White Light (Soft Clean Glow)": {
+        "PrimaryColour": "&H00FFFFFF",
+        "OutlineColour": "&H40000000",
+        "BackColour": "&H70000000",
+        "BorderStyle": 1,
+        "Outline": 1.6,
+        "Shadow": 2.8,
+        "Bold": 1,
+    },
+    "🌟 Viral Reel Yellow (Bold Black Border)": {
+        "PrimaryColour": "&H0000FFFF",
+        "OutlineColour": "&H00000000",
+        "BackColour": "&H00000000",
+        "BorderStyle": 1,
+        "Outline": 2.5,
+        "Shadow": 1.5,
+        "Bold": 1,
+    },
+    "⚪ Classic Crisp White (Bold Black Border)": {
+        "PrimaryColour": "&H00FFFFFF",
+        "OutlineColour": "&H00000000",
+        "BackColour": "&H00000000",
+        "BorderStyle": 1,
+        "Outline": 2.5,
+        "Shadow": 1.0,
+        "Bold": 1,
+    },
+    "🖤 Frosted Pill Box (Modern Translucent Bar)": {
+        "PrimaryColour": "&H00FFFFFF",
+        "OutlineColour": "&H00000000",
+        "BackColour": "&H85000000",
+        "BorderStyle": 3,
+        "Outline": 1.0,
+        "Shadow": 0.0,
+        "Bold": 1,
+    },
+    "💎 Neon Aqua / Cyan (Tech & Podcast)": {
+        "PrimaryColour": "&H00FFFF00",
+        "OutlineColour": "&H00000000",
+        "BackColour": "&H60000000",
+        "BorderStyle": 1,
+        "Outline": 2.2,
+        "Shadow": 2.0,
+        "Bold": 1,
+    },
+    "🔥 Golden Glow (Warm Aesthetic)": {
+        "PrimaryColour": "&H003AD7FF",
+        "OutlineColour": "&H00000000",
+        "BackColour": "&H60000000",
+        "BorderStyle": 1,
+        "Outline": 2.2,
+        "Shadow": 2.0,
+        "Bold": 1,
+    },
+    "🌿 Vibrant Lime (High Impact)": {
+        "PrimaryColour": "&H0032FF7E",
+        "OutlineColour": "&H00000000",
+        "BackColour": "&H60000000",
+        "BorderStyle": 1,
+        "Outline": 2.5,
+        "Shadow": 1.5,
+        "Bold": 1,
+    }
+}
+
+
+def build_ass_style(
+    style_name: Optional[str] = "✨ Soothe White Light (Soft Clean Glow)",
+    font_name: str = "Kohinoor Devanagari",
+    font_size: int = 22,
+    margin_v: int = 35,
+    fallback_color: Optional[str] = None
+) -> str:
+    """Builds an ASS force_style string based on caption style preset."""
+    chosen_style = None
+    if style_name:
+        for k, v in CAPTION_STYLES.items():
+            if k == style_name or k.lower() in style_name.lower() or style_name.lower() in k.lower():
+                chosen_style = v
+                break
+
+    if not chosen_style:
+        chosen_style = CAPTION_STYLES["✨ Soothe White Light (Soft Clean Glow)"].copy()
+        if fallback_color:
+            chosen_style["PrimaryColour"] = fallback_color
+
+    primary = chosen_style.get("PrimaryColour", "&H00FFFFFF")
+    outline_col = chosen_style.get("OutlineColour", "&H00000000")
+    back_col = chosen_style.get("BackColour", "&H00000000")
+    border_style = chosen_style.get("BorderStyle", 1)
+    outline = chosen_style.get("Outline", 2.0)
+    shadow = chosen_style.get("Shadow", 1.0)
+    bold = chosen_style.get("Bold", 1)
+
+    parts = [
+        f"FontName={font_name}",
+        f"FontSize={font_size}",
+        f"PrimaryColour={primary}",
+        f"OutlineColour={outline_col}",
+        f"BackColour={back_col}",
+        f"Bold={bold}",
+        f"BorderStyle={border_style}",
+        f"Outline={outline}",
+        f"Shadow={shadow}",
+        "Alignment=2",
+        f"MarginV={margin_v}"
+    ]
+    return ",".join(parts)
+
+
 def extract_pad_info(crop_filter: Optional[str]) -> Tuple[int, int, int, int]:
     """
     Extracts base_w, base_h, pad_top_px, pad_bottom_px from crop_filter.
@@ -104,7 +218,9 @@ def get_bottom_fade_asset(
     If not already on disk, generates it via Pillow automatically.
     Seamlessly blends into bottom frame padding (letterboxing).
     """
-    fname = f"bottom_fade_{total_w}x{total_h}_t{pad_top_px}_b{pad_bottom_px}.png"
+    h_pct = int(round(fade_height_frac * 100))
+    o_pct = int(round(max_opacity * 100))
+    fname = f"bottom_fade_{total_w}x{total_h}_t{pad_top_px}_b{pad_bottom_px}_h{h_pct}_o{o_pct}.png"
     grad_path = ASSETS_DIR / fname
     if grad_path.exists() and grad_path.stat().st_size > 500:
         return str(grad_path)
@@ -307,6 +423,7 @@ def run_pipeline(
     font_name: str = "Kohinoor Devanagari",
     font_size: int = 22,
     font_color: str = "&H00FFFFFF",
+    caption_style: Optional[str] = None,
     bitrate: str = "5000k",
     bottom_fade: bool = False,
     fade_height: float = 0.38,
@@ -344,7 +461,7 @@ def run_pipeline(
     if has_srt:
         sub_ext = Path(srt_path).suffix.lower()
         # If time-sliced or format is .lrc / .vtt, prepare shifted/converted SRT
-        if (start_sec is not None and start_sec > 0) or sub_ext in [".lrc", ".vtt"]:
+        if (start_sec is not None and (start_sec > 0 or duration_sec is not None)) or sub_ext in [".lrc", ".vtt"]:
             temp_shifted_srt = str(Path(output_path).parent / f".tmp_sub_{uuid.uuid4().hex[:12]}.srt")
             end_sec = ((start_sec or 0.0) + duration_sec) if duration_sec else None
             ok = prepare_shifted_subtitles(
@@ -399,10 +516,12 @@ def run_pipeline(
         else:
             _, _, _, pad_b_px = extract_pad_info(crop_filter)
             final_margin_v = (sub_margin_v if sub_margin_v is not None else (pad_b_px + 35))
-            style = (
-                f"FontName={font_name},FontSize={font_size},"
-                f"PrimaryColour={font_color},OutlineColour=&H00000000,"
-                f"BorderStyle=1,Outline=2.5,Shadow=1,Alignment=2,MarginV={final_margin_v}"
+            style = build_ass_style(
+                style_name=caption_style,
+                font_name=font_name,
+                font_size=font_size,
+                margin_v=final_margin_v,
+                fallback_color=font_color
             )
             sub_filter = f"subtitles='{escaped_sub}':force_style='{style}'"
         filter_complex_parts.append(f"[{v_curr}]{sub_filter}[v_sub]")
@@ -527,6 +646,190 @@ def run_pipeline(
                 pass
 
 
+def concat_video_segments(
+    segment_paths: list,
+    output_path: str,
+    use_hw_accel: bool = True,
+    bitrate: str = "5000k"
+) -> None:
+    """Concatenates multiple video segments seamlessly, first attempting fast stream copy, then fallback re-encode."""
+    if not segment_paths:
+        raise ValueError("No video segments to concatenate.")
+    if len(segment_paths) == 1:
+        shutil.copy2(segment_paths[0], output_path)
+        return
+
+    out_dir = Path(output_path).parent
+    list_path = out_dir / f".concat_list_{uuid.uuid4().hex[:8]}.txt"
+    try:
+        with open(list_path, "w", encoding="utf-8") as f:
+            for p in segment_paths:
+                esc = os.path.abspath(p).replace("'", "'\\''")
+                f.write(f"file '{esc}'\n")
+
+        # Attempt 1: Fast stream copy via concat demuxer
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_path),
+            "-c", "copy",
+            str(output_path)
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            return
+
+        # Attempt 2: Fallback filter concat
+        encoders = get_available_encoders()
+        hw_enabled = use_hw_accel and encoders.get("videotoolbox", False)
+
+        fallback_cmd = ["ffmpeg", "-y"]
+        for p in segment_paths:
+            fallback_cmd.extend(["-i", p])
+
+        v_info = probe_video(segment_paths[0])
+        has_audio = v_info.get("has_audio", False)
+
+        if has_audio:
+            filter_str = "".join(f"[{i}:v][{i}:a]" for i in range(len(segment_paths))) + f"concat=n={len(segment_paths)}:v=1:a=1[v][a]"
+            maps = ["-map", "[v]", "-map", "[a]"]
+            acodec = ["-c:a", "aac", "-b:a", "192k"]
+        else:
+            filter_str = "".join(f"[{i}:v]" for i in range(len(segment_paths))) + f"concat=n={len(segment_paths)}:v=1[v]"
+            maps = ["-map", "[v]"]
+            acodec = []
+
+        if hw_enabled:
+            vcodec = ["-c:v", "h264_videotoolbox", "-b:v", bitrate, "-pix_fmt", "yuv420p"]
+        else:
+            vcodec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
+
+        fallback_cmd.extend(["-filter_complex", filter_str] + maps + vcodec + acodec + [str(output_path)])
+        subprocess.run(fallback_cmd, check=True, capture_output=True)
+    finally:
+        if list_path.exists():
+            try:
+                list_path.unlink()
+            except Exception:
+                pass
+
+
+def generate_3segment_preview(
+    video_path: str,
+    output_path: str,
+    crop_filter: Optional[str] = None,
+    srt_path: Optional[str] = None,
+    music_path: Optional[str] = None,
+    music_volume: float = 0.12,
+    segment_duration: float = 60.0,
+    percentages: Tuple[float, float, float] = (0.0, 0.45, 0.75),
+    use_hw_accel: bool = True,
+    font_name: str = "Kohinoor Devanagari",
+    font_size: int = 22,
+    font_color: str = "&H00FFFFFF",
+    caption_style: Optional[str] = None,
+    bitrate: str = "5000k",
+    bottom_fade: bool = False,
+    fade_height: float = 0.38,
+    fade_opacity: float = 0.92,
+    sub_margin_v: Optional[int] = None,
+    cancel_check: Optional[Any] = None,
+    proc_callback: Optional[Any] = None,
+    status_callback: Optional[Any] = None
+) -> str:
+    """
+    Generates a 3-segment combined test preview video:
+    - Segment 1: Starting at 0% (beginning of video)
+    - Segment 2: Starting at 45% of total video duration
+    - Segment 3: Starting at 75% of total video duration
+    Each segment is rendered for `segment_duration` (default 60s / 1 min)
+    with all chosen video transforms (aspect ratio crop, subtitle shift/burn, music ducking, bottom fade).
+    The 3 segments are then seamlessly combined into one final preview video.
+    """
+    check_dependencies()
+    v_info = probe_video(video_path)
+    total_dur = v_info["duration"]
+    if total_dur <= 0:
+        raise ValueError(f"Invalid video duration: {total_dur}s")
+
+    out_dir = Path(output_path).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    starts = [total_dur * p for p in percentages]
+    durations = []
+    for s in starts:
+        rem = max(1.0, total_dur - s)
+        durations.append(min(segment_duration, rem))
+
+    temp_segments = []
+    uid = uuid.uuid4().hex[:8]
+
+    try:
+        for idx, (start_t, dur_t) in enumerate(zip(starts, durations)):
+            if cancel_check and cancel_check():
+                raise RuntimeError("Operation stopped by user (Master Kill).")
+
+            seg_path = str(out_dir / f".tmp_preview_seg_{idx+1}_{uid}.mp4")
+            temp_segments.append(seg_path)
+
+            pct_label = f"{int(percentages[idx] * 100)}%"
+            m, s = divmod(int(start_t), 60)
+            time_str = f"{m:02d}:{s:02d}"
+
+            print(f"\n🎬 Rendering Test Segment {idx+1}/{len(starts)}: at {pct_label} ({time_str}, duration {dur_t:.1f}s)...")
+
+            if status_callback:
+                status_callback(idx + 1, len(starts), start_t, dur_t, "rendering")
+
+            run_pipeline(
+                video_path=video_path,
+                output_path=seg_path,
+                crop_filter=crop_filter,
+                srt_path=srt_path,
+                music_path=music_path,
+                music_volume=music_volume,
+                start_sec=start_t,
+                duration_sec=dur_t,
+                use_hw_accel=use_hw_accel,
+                font_name=font_name,
+                font_size=font_size,
+                font_color=font_color,
+                caption_style=caption_style,
+                bitrate=bitrate,
+                bottom_fade=bottom_fade,
+                fade_height=fade_height,
+                fade_opacity=fade_opacity,
+                sub_margin_v=sub_margin_v,
+                cancel_check=cancel_check,
+                proc_callback=proc_callback
+            )
+
+        if cancel_check and cancel_check():
+            raise RuntimeError("Operation stopped by user (Master Kill).")
+
+        print(f"\n⚡ Combining {len(temp_segments)} segments into: {output_path}")
+        if status_callback:
+            status_callback(len(starts), len(starts), 0, 0, "combining")
+
+        concat_video_segments(temp_segments, output_path, use_hw_accel=use_hw_accel, bitrate=bitrate)
+        print(f"✅ Successfully created combined 3-segment test preview: {output_path}")
+        return output_path
+
+    finally:
+        for p in temp_segments:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+        if cancel_check and cancel_check() and os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="High-Speed Headless Video Processing Engine (Whole Video or Preview)"
@@ -553,6 +856,9 @@ def main():
     parser.add_argument("--font", default="Kohinoor Devanagari", help="Font for subtitles")
     parser.add_argument("--font-size", type=int, default=22, help="Font size for subtitles")
     parser.add_argument("--font-color", default="&H00FFFFFF", help="Font color for subtitles (&H00FFFFFF for white, &H0000FFFF for yellow)")
+    parser.add_argument("--caption-style", default="✨ Soothe White Light (Soft Clean Glow)", help="Preset caption style (e.g. 'Soothe White Light', 'Viral Reel Yellow', 'Frosted Pill Box')")
+    parser.add_argument("--multi-preview", action="store_true", help="Generate a 3-segment combined test preview (0%%, 45%%, 75%% of video length, 1 min each combined into 1 video)")
+    parser.add_argument("--preview-seg-dur", type=float, default=60.0, help="Duration of each segment in multi-preview in seconds (default: 60.0s / 1 min)")
     parser.add_argument("--bitrate", default="6000k", help="Video bitrate for VideoToolbox encoding (default 6000k)")
 
     args = parser.parse_args()
@@ -576,25 +882,48 @@ def main():
     else:
         crop_filter = None
 
-    run_pipeline(
-        video_path=args.video,
-        output_path=args.output,
-        crop_filter=crop_filter,
-        srt_path=args.srt,
-        music_path=args.music,
-        music_volume=args.volume,
-        start_sec=args.start,
-        duration_sec=args.duration,
-        use_hw_accel=not args.no_hw,
-        font_name=args.font,
-        font_size=args.font_size,
-        font_color=args.font_color,
-        bitrate=args.bitrate,
-        bottom_fade=args.bottom_fade,
-        fade_height=args.fade_height,
-        fade_opacity=args.fade_opacity,
-        sub_margin_v=args.sub_margin
-    )
+    if args.multi_preview:
+        generate_3segment_preview(
+            video_path=args.video,
+            output_path=args.output,
+            crop_filter=crop_filter,
+            srt_path=args.srt,
+            music_path=args.music,
+            music_volume=args.volume,
+            segment_duration=args.preview_seg_dur,
+            percentages=(0.0, 0.45, 0.75),
+            use_hw_accel=not args.no_hw,
+            font_name=args.font,
+            font_size=args.font_size,
+            font_color=args.font_color,
+            caption_style=args.caption_style,
+            bitrate=args.bitrate,
+            bottom_fade=args.bottom_fade,
+            fade_height=args.fade_height,
+            fade_opacity=args.fade_opacity,
+            sub_margin_v=args.sub_margin
+        )
+    else:
+        run_pipeline(
+            video_path=args.video,
+            output_path=args.output,
+            crop_filter=crop_filter,
+            srt_path=args.srt,
+            music_path=args.music,
+            music_volume=args.volume,
+            start_sec=args.start,
+            duration_sec=args.duration,
+            use_hw_accel=not args.no_hw,
+            font_name=args.font,
+            font_size=args.font_size,
+            font_color=args.font_color,
+            caption_style=args.caption_style,
+            bitrate=args.bitrate,
+            bottom_fade=args.bottom_fade,
+            fade_height=args.fade_height,
+            fade_opacity=args.fade_opacity,
+            sub_margin_v=args.sub_margin
+        )
 
 
 if __name__ == "__main__":

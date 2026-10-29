@@ -23,13 +23,18 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 from tkinter import filedialog, messagebox
 
+import copy
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFont
 
 # Import core multimedia processor & utilities
-from process_full import probe_video, compute_crop_filter, run_pipeline, get_available_encoders
+from process_full import (
+    probe_video, compute_crop_filter, run_pipeline, get_available_encoders,
+    generate_3segment_preview, CAPTION_STYLES
+)
 from sub_utils import parse_timestamp_entries, sanitize_filename, auto_fix_timestamp_text
 from clip_tester import extract_thumbnail
+from config_manager import load_saved_config, save_saved_config
 
 # Set appearance and theme
 ctk.set_appearance_mode("Dark")
@@ -56,31 +61,69 @@ class StudioClipperApp(ctk.CTk):
         self.base_frame_image: Optional[Image.Image] = None
         self.raw_frame_path = str(BASE_DIR / ".temp_raw_frame.jpg")
 
-        self.current_ratio = "9:16"
-        self.current_scale = 1.0
-        self.current_pos_x = 0.5
-        self.current_pos_y = 0.5
-        self.current_pad_top = 0.0
-        self.current_pad_bottom = 0.0
-        self.current_vol = 0.12
-        self.bottom_fade_var = ctk.BooleanVar(value=True)
-        self.fade_height = 0.38
-        self.fade_opacity = 0.92
+        # Load Persistent Configuration
+        saved_cfg = load_saved_config()
+        self.shorts_config = saved_cfg["shorts_config"]
+        self.videos_config = saved_cfg["videos_config"]
+        self.active_mode = saved_cfg.get("active_mode", "shorts")
+
+        # Active mode profile (Sections 1 & 2)
+        active_cfg = self.shorts_config if self.active_mode == "shorts" else self.videos_config
+        self.current_ratio = active_cfg["ratio_val"]
+        self.current_scale = active_cfg["scale"]
+        self.current_pos_x = active_cfg["pos_x"]
+        self.current_pos_y = active_cfg["pos_y"]
+        self.current_pad_top = active_cfg["pad_top"]
+        self.current_pad_bottom = active_cfg["pad_bottom"]
+        self.bottom_fade_var = ctk.BooleanVar(value=active_cfg["bottom_fade"])
+        self.fade_height = active_cfg.get("fade_height", 0.38)
+        self.fade_opacity = active_cfg.get("fade_opacity", 0.92)
+
+        # Universal Sections 3 (Subtitles) & 4 (Music & Volume)
+        sub_cfg = saved_cfg.get("subtitles", {})
+        self.saved_caption_style = sub_cfg.get("style", "✨ Soothe White Light (Soft Clean Glow)")
+        self.saved_font_size = sub_cfg.get("size", "Medium (22pt)")
+        self.saved_caption_pos = sub_cfg.get("position", "Caption: On Video Fade (Above Padding)")
+        self.saved_sub_enabled = sub_cfg.get("enabled", True)
+        self.saved_srt_path = sub_cfg.get("path", "")
+
+        music_cfg = saved_cfg.get("music", {})
+        self.saved_music_enabled = music_cfg.get("enabled", True)
+        self.saved_music_path = music_cfg.get("path", "")
+        self.current_vol = music_cfg.get("volume", active_cfg.get("vol", 0.12))
+
+        self.saved_skip_existing = saved_cfg.get("skip_existing", True)
+
         self.preview_mode = "reel"
         self.is_rendering = False
         self.is_cancelled = False
         self.current_proc = None
-        self.skip_existing_var = ctk.BooleanVar(value=True)
+        self.skip_existing_var = ctk.BooleanVar(value=self.saved_skip_existing)
 
         self.encoders = get_available_encoders()
         self.hw_label = "Apple Silicon VideoToolbox (Hardware Acceleration)" if self.encoders.get("videotoolbox") else "CPU (libx264)"
 
         self._build_ui()
 
-        # Auto-check if TRATAK video exists on Desktop as a convenience
-        default_video = Path.home() / "Desktop" / "CONCENTRATION AND TRATAK_480p.mp4"
-        if default_video.exists():
-            self._load_video(str(default_video))
+        # Section 1: Restore saved video for active mode if it exists
+        saved_vid = active_cfg.get("video_path", "")
+        if saved_vid and os.path.exists(saved_vid):
+            self._load_video(saved_vid)
+        else:
+            default_video = Path.home() / "Desktop" / "CONCENTRATION AND TRATAK_480p.mp4"
+            if default_video.exists():
+                self._load_video(str(default_video))
+
+        # Restore universal subtitle & music paths if valid
+        if hasattr(self, "saved_srt_path") and self.saved_srt_path and os.path.exists(self.saved_srt_path):
+            self.srt_path = self.saved_srt_path
+            self.srt_entry.delete(0, "end")
+            self.srt_entry.insert(0, self.saved_srt_path)
+
+        if hasattr(self, "saved_music_path") and self.saved_music_path and os.path.exists(self.saved_music_path):
+            self.music_path = self.saved_music_path
+            self.music_entry.delete(0, "end")
+            self.music_entry.insert(0, self.saved_music_path)
 
     def _build_ui(self):
         # Configure layout (2 columns)
@@ -89,38 +132,82 @@ class StudioClipperApp(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
 
         # ==============================================================
-        # LEFT COLUMN: CONTROLS & FILE PICKERS (Scrollable)
+        # LEFT COLUMN: CONTROLS & FILE PICKERS (Scrollable to Bottom)
         # ==============================================================
-        self.left_frame = ctk.CTkScrollableFrame(self, label_text="Project Configuration", corner_radius=10)
+        self.left_frame = ctk.CTkScrollableFrame(self, corner_radius=10)
         self.left_frame.grid(row=0, column=0, padx=(16, 8), pady=16, sticky="nsew")
 
-        # Header Badge
-        hw_color = "#10b981" if self.encoders.get("videotoolbox") else "#6366f1"
-        self.badge = ctk.CTkLabel(
+        # Ensure smooth mousewheel/trackpad scrolling throughout left_frame even over sliders & controls
+        def _custom_check_scroll(widget):
+            if widget == self.left_frame._parent_canvas:
+                return True
+            if isinstance(widget, (ctk.CTkScrollbar, ctk.CTkTextbox)):
+                return False
+            if isinstance(widget, ctk.CTkScrollableFrame):
+                return widget._parent_canvas == self.left_frame._parent_canvas
+            if widget.master is not None:
+                return _custom_check_scroll(widget.master)
+            return False
+
+        self.left_frame._check_if_valid_scroll = _custom_check_scroll
+
+        # -------------------------------------------------------------
+        # SHORTS vs VIDEOS MODE SWITCHER CARD + 1-CLICK FOLDER AUTO-RUN
+        # -------------------------------------------------------------
+        mode_card = ctk.CTkFrame(
             self.left_frame,
-            text=f"⚡ {self.hw_label}",
-            text_color=hw_color,
-            font=ctk.CTkFont(size=12, weight="bold")
+            fg_color="#182030",
+            border_width=1,
+            border_color="#334155",
+            corner_radius=22
         )
-        self.badge.pack(anchor="w", pady=(0, 10))
+        mode_card.pack(fill="x", pady=(0, 14))
 
-        # 1-Click Folder Automation Card
-        folder_box = ctk.CTkFrame(self.left_frame, fg_color="#182030", border_width=1, border_color="#3b82f6", corner_radius=8)
-        folder_box.pack(fill="x", pady=(0, 14))
+        pill_box = ctk.CTkFrame(mode_card, fg_color="#0f172a", corner_radius=18)
+        pill_box.pack(side="left", padx=6, pady=4)
 
-        ctk.CTkLabel(folder_box, text="⚡ 1-Click Folder Auto-Run", font=ctk.CTkFont(size=13, weight="bold"), text_color="#60a5fa").pack(anchor="w", padx=10, pady=(8, 2))
-        ctk.CTkLabel(folder_box, text="Pick 1 folder with your video, subtitles, music & timestamps.\nEverything is detected and clipped automatically!", font=ctk.CTkFont(size=11), text_color="gray", justify="left").pack(anchor="w", padx=10, pady=(0, 6))
+        self.btn_mode_shorts = ctk.CTkButton(
+            pill_box,
+            text="Shorts",
+            width=92,
+            height=32,
+            corner_radius=16,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#cbd5e1",
+            text_color="#0f172a",
+            hover_color="#e2e8f0",
+            command=lambda: self._switch_mode("shorts")
+        )
+        self.btn_mode_shorts.pack(side="left", padx=2, pady=2)
+
+        self.btn_mode_videos = ctk.CTkButton(
+            pill_box,
+            text="Videos",
+            width=92,
+            height=32,
+            corner_radius=16,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="transparent",
+            text_color="#94a3b8",
+            hover_color="#242c3d",
+            command=lambda: self._switch_mode("videos")
+        )
+        self.btn_mode_videos.pack(side="left", padx=2, pady=2)
 
         self.btn_1click_folder = ctk.CTkButton(
-            folder_box,
-            text="📂 Choose Folder & Auto-Run Everything",
+            mode_card,
+            text="⚡ 1-Click",
+            width=86,
+            height=32,
+            corner_radius=16,
+            font=ctk.CTkFont(size=12, weight="bold"),
             fg_color="#2563eb",
+            text_color="#ffffff",
             hover_color="#1d4ed8",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            height=36,
             command=self._choose_folder_and_run
         )
-        self.btn_1click_folder.pack(fill="x", padx=10, pady=(0, 8))
+        self.btn_1click_folder.pack(side="right", padx=(0, 8), pady=4)
+        self.btn_auto_badge = self.btn_1click_folder
 
         # 1. Source Video Selection
         self._create_section_label(self.left_frame, "1. Source Video (.mp4, .mov, .mkv)")
@@ -143,7 +230,7 @@ class StudioClipperApp(ctk.CTk):
         self.meta_label.pack(anchor="w", pady=(0, 14))
 
         # 2. Aspect Ratio & Crop Positioning
-        self._create_section_label(self.left_frame, "2. Aspect Ratio & Crop Framing")
+        self.section_2_label = self._create_section_label(self.left_frame, "2. Aspect Ratio & Crop Framing (📱 Shorts)")
 
         self.ratio_segmented = ctk.CTkSegmentedButton(
             self.left_frame,
@@ -155,7 +242,7 @@ class StudioClipperApp(ctk.CTk):
 
         self.ratio_info_label = ctk.CTkLabel(
             self.left_frame,
-            text="💡 Selected ratio applies to Shorts (≤3m). Clips >3m are automatically kept in 16:9 (unscaled original video with bg music & subs).",
+            text="💡 Selected ratio & framing apply to Shorts (≤3m). Clips >3m automatically use Videos settings.",
             font=ctk.CTkFont(size=11),
             text_color="#9ca3af",
             wraplength=340,
@@ -439,7 +526,7 @@ class StudioClipperApp(ctk.CTk):
         self._attach_button_repeat(self.btn_pad_bottom_plus, self._pad_bottom_step_plus)
         self._disable_slider_scroll(self.pad_bottom_slider, self.left_frame)
 
-        # --- E. Bottom Black Fade (Caption Contrast) Switch ---
+        # --- E. Bottom Black Fade (Caption Contrast) Switch & Controls ---
         fade_box = ctk.CTkFrame(self.left_frame, fg_color="#182030", border_width=1, border_color="#374151", corner_radius=8)
         fade_box.pack(fill="x", pady=(0, 14))
 
@@ -460,17 +547,71 @@ class StudioClipperApp(ctk.CTk):
             text_color="#94a3b8",
             wraplength=320,
             justify="left"
-        ).pack(anchor="w", padx=10, pady=(0, 8))
+        ).pack(anchor="w", padx=10, pady=(0, 6))
+
+        # Collapsible controls frame for adjusting fade
+        self.fade_ctrl_frame = ctk.CTkFrame(fade_box, fg_color="transparent")
+        if self.bottom_fade_var.get():
+            self.fade_ctrl_frame.pack(fill="x", padx=10, pady=(0, 8))
+
+        # 1. Fade Spread / Height Slider
+        self.fade_height_label_var = ctk.StringVar(value=f"Fade Spread: {int(round(self.fade_height * 100))}% (Coverage)")
+        ctk.CTkLabel(self.fade_ctrl_frame, textvariable=self.fade_height_label_var, font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(2, 1))
+
+        fh_ctrl = ctk.CTkFrame(self.fade_ctrl_frame, fg_color="transparent")
+        fh_ctrl.pack(fill="x", pady=(0, 6))
+
+        self.btn_fh_minus = ctk.CTkButton(fh_ctrl, text="-", width=28, height=24, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_fh_minus.pack(side="left", padx=(0, 6))
+
+        self.fade_height_slider = ctk.CTkSlider(fh_ctrl, from_=0.15, to=0.70, number_of_steps=55, command=self._on_fade_height_slider_changed)
+        self.fade_height_slider.set(self.fade_height)
+        self.fade_height_slider.pack(side="left", fill="x", expand=True)
+
+        self.btn_fh_plus = ctk.CTkButton(fh_ctrl, text="+", width=28, height=24, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_fh_plus.pack(side="right", padx=(6, 0))
+
+        self._attach_button_repeat(self.btn_fh_minus, self._fade_height_step_minus)
+        self._attach_button_repeat(self.btn_fh_plus, self._fade_height_step_plus)
+        self._disable_slider_scroll(self.fade_height_slider, self.left_frame)
+
+        # 2. Fade Darkness / Opacity Slider
+        self.fade_opacity_label_var = ctk.StringVar(value=f"Fade Darkness: {int(round(self.fade_opacity * 100))}% (Contrast)")
+        ctk.CTkLabel(self.fade_ctrl_frame, textvariable=self.fade_opacity_label_var, font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(2, 1))
+
+        fo_ctrl = ctk.CTkFrame(self.fade_ctrl_frame, fg_color="transparent")
+        fo_ctrl.pack(fill="x", pady=(0, 6))
+
+        self.btn_fo_minus = ctk.CTkButton(fo_ctrl, text="-", width=28, height=24, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_fo_minus.pack(side="left", padx=(0, 6))
+
+        self.fade_opacity_slider = ctk.CTkSlider(fo_ctrl, from_=0.30, to=1.0, number_of_steps=70, command=self._on_fade_opacity_slider_changed)
+        self.fade_opacity_slider.set(self.fade_opacity)
+        self.fade_opacity_slider.pack(side="left", fill="x", expand=True)
+
+        self.btn_fo_plus = ctk.CTkButton(fo_ctrl, text="+", width=28, height=24, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_fo_plus.pack(side="right", padx=(6, 0))
+
+        self._attach_button_repeat(self.btn_fo_minus, self._fade_opacity_step_minus)
+        self._attach_button_repeat(self.btn_fo_plus, self._fade_opacity_step_plus)
+        self._disable_slider_scroll(self.fade_opacity_slider, self.left_frame)
+
+        # 3. Quick Presets Row
+        fade_presets_row = ctk.CTkFrame(self.fade_ctrl_frame, fg_color="transparent")
+        fade_presets_row.pack(fill="x", pady=(2, 4))
+        ctk.CTkButton(fade_presets_row, text="Subtle (25%)", height=24, font=ctk.CTkFont(size=10), fg_color="#2b3245", hover_color="#3b445c", command=lambda: self._set_fade_preset(0.25, 0.80)).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(fade_presets_row, text="Standard (38%)", height=24, font=ctk.CTkFont(size=10), fg_color="#374151", hover_color="#4b5563", command=lambda: self._set_fade_preset(0.38, 0.92)).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(fade_presets_row, text="Deep (52%)", height=24, font=ctk.CTkFont(size=10), fg_color="#2b3245", hover_color="#3b445c", command=lambda: self._set_fade_preset(0.52, 1.0)).pack(side="left", expand=True, fill="x")
 
         # 3. Subtitles & Captions / Lyrics
         self._create_section_label(self.left_frame, "3. Subtitles & Lyrics (.srt, .ass, .lrc)")
         
-        self.sub_switch_var = ctk.BooleanVar(value=True)
+        self.sub_switch_var = ctk.BooleanVar(value=self.saved_sub_enabled)
         self.sub_switch = ctk.CTkSwitch(
             self.left_frame,
             text="Burn Subtitles / Lyrics into Video",
             variable=self.sub_switch_var,
-            command=self._update_cli_display
+            command=lambda: (self._update_cli_display(), self._save_persistent_config())
         )
         self.sub_switch.pack(anchor="w", pady=(0, 8))
 
@@ -483,46 +624,52 @@ class StudioClipperApp(ctk.CTk):
         self.btn_browse_srt = ctk.CTkButton(sub_box, text="📁 Choose File", width=110, command=self._browse_srt)
         self.btn_browse_srt.pack(side="right")
 
-        # Subtitle Color & Size
-        sub_style_box = ctk.CTkFrame(self.left_frame, fg_color="transparent")
-        sub_style_box.pack(fill="x", pady=(0, 14))
-        
-        self.color_menu = ctk.CTkOptionMenu(
-            sub_style_box,
-            values=["White Text (Black Border)", "Yellow Text (Black Border)"],
-            width=180,
-            command=lambda _: self._update_cli_display()
+        # Caption Style Menu (Presets from marketplace: Soothe White Light, Viral Yellow, etc.)
+        ctk.CTkLabel(self.left_frame, text="Caption Style Preset:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#cbd5e1").pack(anchor="w", pady=(4, 2))
+
+        caption_styles_list = list(CAPTION_STYLES.keys())
+        self.caption_style_menu = ctk.CTkOptionMenu(
+            self.left_frame,
+            values=caption_styles_list,
+            command=self._on_caption_style_changed
         )
-        self.color_menu.set("White Text (Black Border)")
-        self.color_menu.pack(side="left", padx=(0, 8))
+        # Verify saved style is in list
+        if self.saved_caption_style in caption_styles_list:
+            self.caption_style_menu.set(self.saved_caption_style)
+        else:
+            self.caption_style_menu.set("✨ Soothe White Light (Soft Clean Glow)")
+        self.caption_style_menu.pack(fill="x", pady=(0, 8))
+
+        # Subtitle Size & Vertical Placement
+        sub_opts_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        sub_opts_frame.pack(fill="x", pady=(0, 14))
 
         self.size_menu = ctk.CTkOptionMenu(
-            sub_style_box,
+            sub_opts_frame,
             values=["Compact (18pt)", "Medium (22pt)", "Large (26pt)", "Extra Large (30pt)"],
-            width=140,
-            command=lambda _: self._update_cli_display()
+            width=135,
+            command=lambda _: (self._update_cli_display(), self._save_persistent_config())
         )
-        self.size_menu.set("Medium (22pt)")
-        self.size_menu.pack(side="left")
+        self.size_menu.set(self.saved_font_size)
+        self.size_menu.pack(side="left", padx=(0, 8))
 
-        # Caption Vertical Placement (Above Padding on Video vs Bottom Black Bar)
         self.caption_pos_menu = ctk.CTkOptionMenu(
-            self.left_frame,
+            sub_opts_frame,
             values=["Caption: On Video Fade (Above Padding)", "Caption: Inside Black Bottom Bar"],
-            command=lambda _: (self._render_visual_crop(), self._update_cli_display())
+            command=lambda _: (self._render_visual_crop(), self._update_cli_display(), self._save_persistent_config())
         )
-        self.caption_pos_menu.set("Caption: On Video Fade (Above Padding)")
-        self.caption_pos_menu.pack(fill="x", pady=(0, 14))
+        self.caption_pos_menu.set(self.saved_caption_pos)
+        self.caption_pos_menu.pack(side="left", fill="x", expand=True)
 
         # 4. Background Music & Ducking
         self._create_section_label(self.left_frame, "4. Background Music & Ducking (.mp3, .wav)")
 
-        self.music_switch_var = ctk.BooleanVar(value=True)
+        self.music_switch_var = ctk.BooleanVar(value=self.saved_music_enabled)
         self.music_switch = ctk.CTkSwitch(
             self.left_frame,
             text="Mix Background Music Track",
             variable=self.music_switch_var,
-            command=self._update_cli_display
+            command=lambda: (self._update_cli_display(), self._save_persistent_config())
         )
         self.music_switch.pack(anchor="w", pady=(0, 8))
 
@@ -536,7 +683,8 @@ class StudioClipperApp(ctk.CTk):
         self.btn_browse_music.pack(side="right")
 
         # Ducking volume slider with - / + nudge buttons
-        self.vol_label_var = ctk.StringVar(value="Background Volume: 12% (Speech stays crisp)")
+        vol_pct = int(round(self.current_vol * 100))
+        self.vol_label_var = ctk.StringVar(value=f"Background Volume: {vol_pct}% (Speech stays crisp)")
         self.vol_label = ctk.CTkLabel(self.left_frame, textvariable=self.vol_label_var, font=ctk.CTkFont(size=12))
         self.vol_label.pack(anchor="w", pady=(0, 2))
 
@@ -562,7 +710,7 @@ class StudioClipperApp(ctk.CTk):
             number_of_steps=50,
             command=self._on_vol_slider_changed
         )
-        self.vol_slider.set(0.12)
+        self.vol_slider.set(self.current_vol)
         self.vol_slider.pack(side="left", fill="x", expand=True)
 
         self.btn_vol_plus = ctk.CTkButton(
@@ -594,14 +742,28 @@ class StudioClipperApp(ctk.CTk):
 
         self.btn_preview = ctk.CTkButton(
             self.left_frame,
-            text="🎬 Generate 1-Min Preview (Opens in Mac Player)",
-            height=42,
+            text="🎬 1-Min Single Preview (at Offset)",
+            height=38,
             fg_color="#6366f1",
             hover_color="#4f46e5",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=13, weight="bold"),
             command=self._start_generate_preview
         )
-        self.btn_preview.pack(fill="x", pady=(0, 10))
+        self.btn_preview.pack(fill="x", pady=(0, 6))
+
+        self.btn_multi_preview = ctk.CTkButton(
+            self.left_frame,
+            text="🎞️ 3-Segment Preview (0%, 45%, 75% • 3 Min)",
+            height=40,
+            fg_color="#7c3aed",
+            hover_color="#6d28d9",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._start_generate_multi_preview
+        )
+        self.btn_multi_preview.pack(fill="x", pady=(0, 10))
+
+        # Bottom scroll clearance spacer (ensures full visibility of buttons when scrolling to bottom)
+        ctk.CTkFrame(self.left_frame, height=36, fg_color="transparent").pack(fill="x", pady=(0, 10))
 
         # ==============================================================
         # ==============================================================
@@ -621,10 +783,10 @@ class StudioClipperApp(ctk.CTk):
 
         self.preview_mode_segmented = ctk.CTkSegmentedButton(
             preview_mode_frame,
-            values=["📱 Final Reel View (9:16)", "📐 16:9 Source Cutout"],
+            values=["📱 Final Framed View", "📐 Source Cutout View"],
             command=self._on_preview_mode_changed
         )
-        self.preview_mode_segmented.set("📱 Final Reel View (9:16)")
+        self.preview_mode_segmented.set("📱 Final Framed View")
         self.preview_mode_segmented.pack(side="left")
 
         self.canvas_label = ctk.CTkLabel(
@@ -933,6 +1095,182 @@ class StudioClipperApp(ctk.CTk):
             self._update_cli_display()
 
     # ==============================================================
+    # SHORTS vs VIDEOS MODE SWITCHING & STATE SYNC
+    # (Only Sections 1 & 2 change per mode. Sections 3 & 4 are Universal)
+    # ==============================================================
+    def _sync_to_active_config(self):
+        """Persists mode-specific control values (1 & 2) into active profile and universal values (3 & 4) to disk."""
+        cfg = self.shorts_config if self.active_mode == "shorts" else self.videos_config
+        # Section 1: Source Video
+        if hasattr(self, "video_path") and self.video_path:
+            cfg["video_path"] = self.video_path
+        # Section 2: Ratio & Crop Framing
+        cfg["ratio_str"] = self.ratio_segmented.get() if hasattr(self, "ratio_segmented") else "9:16 (Shorts/Reels)"
+        cfg["ratio_val"] = self.current_ratio
+        cfg["scale"] = self.current_scale
+        cfg["pos_x"] = self.current_pos_x
+        cfg["pos_y"] = self.current_pos_y
+        cfg["pad_top"] = self.current_pad_top
+        cfg["pad_bottom"] = self.current_pad_bottom
+        cfg["bottom_fade"] = self.bottom_fade_var.get()
+        cfg["fade_height"] = self.fade_height
+        cfg["fade_opacity"] = self.fade_opacity
+
+        self._save_persistent_config()
+
+    def _save_persistent_config(self):
+        """Saves current state into clipper_config.json so it persists across restarts and folder runs."""
+        try:
+            cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else getattr(self, "saved_caption_style", "✨ Soothe White Light (Soft Clean Glow)")
+            cap_size = self.size_menu.get() if hasattr(self, "size_menu") else getattr(self, "saved_font_size", "Medium (22pt)")
+            cap_pos = self.caption_pos_menu.get() if hasattr(self, "caption_pos_menu") else getattr(self, "saved_caption_pos", "Caption: On Video Fade (Above Padding)")
+            sub_on = self.sub_switch_var.get() if hasattr(self, "sub_switch_var") else True
+            music_on = self.music_switch_var.get() if hasattr(self, "music_switch_var") else True
+            skip_on = self.skip_existing_var.get() if hasattr(self, "skip_existing_var") else True
+
+            cfg = {
+                "active_mode": self.active_mode,
+                "shorts_config": copy.deepcopy(self.shorts_config),
+                "videos_config": copy.deepcopy(self.videos_config),
+                # Section 3: Universal Subtitles Configuration
+                "subtitles": {
+                    "enabled": sub_on,
+                    "path": getattr(self, "srt_path", "") or "",
+                    "style": cap_style,
+                    "size": cap_size,
+                    "position": cap_pos
+                },
+                # Section 4: Universal Music & Volume Configuration
+                "music": {
+                    "enabled": music_on,
+                    "path": getattr(self, "music_path", "") or "",
+                    "volume": self.current_vol
+                },
+                "skip_existing": skip_on
+            }
+            save_saved_config(cfg)
+        except Exception:
+            pass
+
+    def _switch_mode(self, new_mode: str):
+        """Switches editing context between Shorts (<=3m) and Videos (>3m & full exports).
+        Only Sections 1 & 2 change per mode. Sections 3 & 4 remain completely universal!
+        """
+        if self.active_mode == new_mode:
+            return
+
+        # 1. Save current controls into current profile
+        self._sync_to_active_config()
+        self.active_mode = new_mode
+
+        # 2. Update pill buttons visual style & section labels
+        if new_mode == "shorts":
+            self.btn_mode_shorts.configure(fg_color="#cbd5e1", text_color="#0f172a", hover_color="#e2e8f0")
+            self.btn_mode_videos.configure(fg_color="transparent", text_color="#94a3b8", hover_color="#242c3d")
+            self.section_2_label.configure(text="2. Aspect Ratio & Crop Framing (📱 Shorts)")
+            self.ratio_info_label.configure(
+                text="💡 Selected ratio & framing apply to Shorts (≤3m). Clips >3m automatically use Videos settings."
+            )
+            self.btn_preview.configure(text="🎬 Generate 1-Min Preview (Shorts Format)")
+            self.btn_preset_shifted.configure(text="🎬 Shift Up (8% / 14%)", command=self._preset_shifted_pad)
+            self.btn_preset_centered.configure(text="↕️ Centered (10% / 10%)", command=self._preset_centered_pad)
+            self.btn_preset_zero.configure(text="Full (0%)", command=self._reset_padding)
+            cfg = self.shorts_config
+        else:
+            self.btn_mode_videos.configure(fg_color="#cbd5e1", text_color="#0f172a", hover_color="#e2e8f0")
+            self.btn_mode_shorts.configure(fg_color="transparent", text_color="#94a3b8", hover_color="#242c3d")
+            self.section_2_label.configure(text="2. Aspect Ratio & Crop Framing (🎬 Videos)")
+            self.ratio_info_label.configure(
+                text="💡 Selected ratio & framing apply to Videos (>3m & full exports). Clips ≤3m automatically use Shorts settings."
+            )
+            self.btn_preview.configure(text="🎬 Generate 1-Min Preview (Videos Format)")
+            self.btn_preset_shifted.configure(text="📺 Full 16:9 (0%)", command=self._reset_padding)
+            self.btn_preset_centered.configure(text="↕️ Letterbox (6% / 6%)", command=lambda: self._set_custom_padding(6.0, 6.0))
+            self.btn_preset_zero.configure(text="🎬 Cinema (12% / 12%)", command=lambda: self._set_custom_padding(12.0, 12.0))
+            cfg = self.videos_config
+
+        # 3. Section 1 (Source Video): restore saved video if set specifically for this mode
+        mode_video = cfg.get("video_path")
+        if mode_video and os.path.exists(mode_video) and mode_video != self.video_path:
+            self._load_video(mode_video)
+
+        # 4. Section 2 (Aspect Ratio & Crop Framing): apply mode profile
+        self.current_ratio = cfg["ratio_val"]
+        self.ratio_segmented.set(cfg["ratio_str"])
+
+        self.current_scale = cfg["scale"]
+        self.scale_slider.set(self.current_scale)
+        pct = int(round(self.current_scale * 100))
+        if self.current_scale == 1.0:
+            desc = "1.00x (Standard Fill 100%)"
+        elif self.current_scale > 1.0:
+            desc = f"{self.current_scale:.2f}x (Scale Up / Zoom {pct}%)"
+        else:
+            desc = f"{self.current_scale:.2f}x (Scale Down / Fit {pct}%)"
+        self.scale_label_var.set(f"Scale / Zoom: {desc}")
+
+        self.current_pos_x = cfg["pos_x"]
+        self.pos_slider.set(self.current_pos_x)
+        pct_x = int(round(self.current_pos_x * 100))
+        lbl_x = "Center (50%)" if pct_x == 50 else (f"Left ({pct_x}%)" if pct_x < 50 else f"Right ({pct_x}%)")
+        self.pos_label_var.set(f"Horizontal Framing (X): {lbl_x}")
+
+        self.current_pos_y = cfg["pos_y"]
+        self.pos_y_slider.set(self.current_pos_y)
+        pct_y = int(round(self.current_pos_y * 100))
+        lbl_y = "Center (50%)" if pct_y == 50 else (f"Top ({pct_y}%)" if pct_y < 50 else f"Bottom ({pct_y}%)")
+        self.pos_y_label_var.set(f"Vertical Framing (Y): {lbl_y}")
+
+        self.current_pad_top = cfg["pad_top"]
+        self.pad_top_slider.set(self.current_pad_top)
+        self.pad_top_label_var.set(f"Top Padding: {self.current_pad_top:.1f}%")
+
+        self.current_pad_bottom = cfg["pad_bottom"]
+        self.pad_bottom_slider.set(self.current_pad_bottom)
+        self.pad_bottom_label_var.set(f"Bottom Padding: {self.current_pad_bottom:.1f}%")
+
+        self.bottom_fade_var.set(cfg["bottom_fade"])
+        self.fade_height = cfg.get("fade_height", 0.38)
+        self.fade_opacity = cfg.get("fade_opacity", 0.92)
+        if hasattr(self, "fade_height_slider"):
+            self.fade_height_slider.set(self.fade_height)
+            self.fade_height_label_var.set(f"Fade Spread: {int(round(self.fade_height * 100))}% (Coverage)")
+        if hasattr(self, "fade_opacity_slider"):
+            self.fade_opacity_slider.set(self.fade_opacity)
+            self.fade_opacity_label_var.set(f"Fade Darkness: {int(round(self.fade_opacity * 100))}% (Contrast)")
+        if hasattr(self, "fade_ctrl_frame"):
+            if cfg["bottom_fade"]:
+                self.fade_ctrl_frame.pack(fill="x", padx=10, pady=(0, 8))
+            else:
+                self.fade_ctrl_frame.pack_forget()
+
+        # NOTE: Sections 3 (Subtitles) & 4 (Music & Volume) are UNIVERSAL and NOT touched here!
+        # They stay completely intact and synced across Shorts, Videos, and 1-Click!
+
+        # 5. Redraw preview & refresh CLI command
+        self._render_visual_crop()
+        self._update_cli_display()
+        self._on_batch_text_changed()
+        self._update_scroll_region()
+
+    def _update_scroll_region(self):
+        try:
+            self.after(50, lambda: self.left_frame._parent_canvas.configure(
+                scrollregion=self.left_frame._parent_canvas.bbox("all")
+            ))
+        except Exception:
+            pass
+
+    def _show_auto_info(self):
+        messagebox.showinfo(
+            "✨ Auto Mode Active",
+            "Auto-Detection is always active during batch processing:\n\n"
+            "• Clips ≤ 3 minutes automatically use your SHORTS settings (9:16 ratio, zoom, pan, padding & fade).\n\n"
+            "• Clips > 3 minutes automatically use your VIDEOS settings (16:9 ratio, custom framing & padding).\n\n"
+            "Switch between 'Shorts' and 'Videos' tabs above to customize both independently!"
+        )
+
+    # ==============================================================
     # CROP RATIO & POSITION UPDATES
     # ==============================================================
     def _on_ratio_changed(self, value: str):
@@ -943,10 +1281,13 @@ class StudioClipperApp(ctk.CTk):
         elif "4:5" in value:
             self.current_ratio = "4:5"
         else:
-            self.current_ratio = "original"
+            self.current_ratio = "16:9"
 
+        self._sync_to_active_config()
         self._render_visual_crop()
         self._update_cli_display()
+        self._update_scroll_region()
+        self._on_batch_text_changed()
 
     def _scale_step_minus(self):
         new_val = max(0.5, min(3.0, round(self.scale_slider.get() - 0.05, 2)))
@@ -992,48 +1333,43 @@ class StudioClipperApp(ctk.CTk):
 
     def _preset_shifted_pad(self):
         """Sets top padding to 8% and bottom padding to 14% to shift clip upward like reference Reel."""
-        self.current_pad_top = 8.0
-        self.current_pad_bottom = 14.0
-        self.pad_top_slider.set(8.0)
-        self.pad_bottom_slider.set(14.0)
-        self.pad_top_label_var.set("Top Padding: 8.0% (Shifted Up)")
-        self.pad_bottom_label_var.set("Bottom Padding: 14.0% (Letterbox)")
-        self._render_visual_crop()
-        self._update_cli_display()
+        self._set_custom_padding(8.0, 14.0)
 
     def _preset_centered_pad(self):
         """Sets balanced 10% top and 10% bottom padding."""
-        self.current_pad_top = 10.0
-        self.current_pad_bottom = 10.0
-        self.pad_top_slider.set(10.0)
-        self.pad_bottom_slider.set(10.0)
-        self.pad_top_label_var.set("Top Padding: 10.0%")
-        self.pad_bottom_label_var.set("Bottom Padding: 10.0%")
-        self._render_visual_crop()
-        self._update_cli_display()
+        self._set_custom_padding(10.0, 10.0)
 
     def _reset_padding(self):
         """Resets padding to 0%."""
-        self.current_pad_top = 0.0
-        self.current_pad_bottom = 0.0
-        self.pad_top_slider.set(0.0)
-        self.pad_bottom_slider.set(0.0)
-        self.pad_top_label_var.set("Top Padding: 0%")
-        self.pad_bottom_label_var.set("Bottom Padding: 0%")
+        self._set_custom_padding(0.0, 0.0)
+
+    def _set_custom_padding(self, top: float, bottom: float):
+        self.current_pad_top = float(top)
+        self.current_pad_bottom = float(bottom)
+        self.pad_top_slider.set(self.current_pad_top)
+        self.pad_bottom_slider.set(self.current_pad_bottom)
+        self.pad_top_label_var.set(f"Top Padding: {self.current_pad_top:.1f}%")
+        self.pad_bottom_label_var.set(f"Bottom Padding: {self.current_pad_bottom:.1f}%")
+        self._sync_to_active_config()
         self._render_visual_crop()
         self._update_cli_display()
+        self._update_scroll_region()
 
     def _on_pad_top_slider_changed(self, value: float):
         self.current_pad_top = round(float(value), 1)
         self.pad_top_label_var.set(f"Top Padding: {self.current_pad_top:.1f}%")
+        self._sync_to_active_config()
         self._render_visual_crop()
         self._update_cli_display()
+        self._update_scroll_region()
 
     def _on_pad_bottom_slider_changed(self, value: float):
         self.current_pad_bottom = round(float(value), 1)
         self.pad_bottom_label_var.set(f"Bottom Padding: {self.current_pad_bottom:.1f}%")
+        self._sync_to_active_config()
         self._render_visual_crop()
         self._update_cli_display()
+        self._update_scroll_region()
 
     def _pad_top_step_minus(self):
         val = max(0.0, round(self.current_pad_top - 1.0, 1))
@@ -1056,15 +1392,80 @@ class StudioClipperApp(ctk.CTk):
         self._on_pad_bottom_slider_changed(val)
 
     def _on_preview_mode_changed(self, mode: str):
-        if "Reel" in mode:
-            self.preview_mode = "reel"
-        else:
+        if "Cutout" in mode:
             self.preview_mode = "source"
+        else:
+            self.preview_mode = "reel"
         self._render_visual_crop()
 
     def _on_fade_switch_changed(self):
+        is_on = self.bottom_fade_var.get()
+        if hasattr(self, "fade_ctrl_frame"):
+            if is_on:
+                self.fade_ctrl_frame.pack(fill="x", padx=10, pady=(0, 8))
+            else:
+                self.fade_ctrl_frame.pack_forget()
+        self._sync_to_active_config()
         self._render_visual_crop()
         self._update_cli_display()
+        self._update_scroll_region()
+
+    def _on_fade_height_slider_changed(self, val):
+        self.fade_height = round(float(val), 2)
+        pct = int(round(self.fade_height * 100))
+        self.fade_height_label_var.set(f"Fade Spread: {pct}% (Coverage)")
+        self._sync_to_active_config()
+        self._render_visual_crop()
+        self._update_cli_display()
+        self._update_scroll_region()
+
+    def _fade_height_step_minus(self):
+        new_val = max(0.15, round(self.fade_height - 0.03, 2))
+        self.fade_height_slider.set(new_val)
+        self._on_fade_height_slider_changed(new_val)
+
+    def _fade_height_step_plus(self):
+        new_val = min(0.70, round(self.fade_height + 0.03, 2))
+        self.fade_height_slider.set(new_val)
+        self._on_fade_height_slider_changed(new_val)
+
+    def _on_fade_opacity_slider_changed(self, val):
+        self.fade_opacity = round(float(val), 2)
+        pct = int(round(self.fade_opacity * 100))
+        self.fade_opacity_label_var.set(f"Fade Darkness: {pct}% (Contrast)")
+        self._sync_to_active_config()
+        self._render_visual_crop()
+        self._update_cli_display()
+        self._update_scroll_region()
+
+    def _fade_opacity_step_minus(self):
+        new_val = max(0.30, round(self.fade_opacity - 0.05, 2))
+        self.fade_opacity_slider.set(new_val)
+        self._on_fade_opacity_slider_changed(new_val)
+
+    def _fade_opacity_step_plus(self):
+        new_val = min(1.0, round(self.fade_opacity + 0.05, 2))
+        self.fade_opacity_slider.set(new_val)
+        self._on_fade_opacity_slider_changed(new_val)
+
+    def _set_fade_preset(self, height: float, opacity: float):
+        self.fade_height = round(height, 2)
+        self.fade_opacity = round(opacity, 2)
+        if hasattr(self, "fade_height_slider"):
+            self.fade_height_slider.set(self.fade_height)
+            self.fade_height_label_var.set(f"Fade Spread: {int(round(self.fade_height * 100))}% (Coverage)")
+        if hasattr(self, "fade_opacity_slider"):
+            self.fade_opacity_slider.set(self.fade_opacity)
+            self.fade_opacity_label_var.set(f"Fade Darkness: {int(round(self.fade_opacity * 100))}% (Contrast)")
+        self._sync_to_active_config()
+        self._render_visual_crop()
+        self._update_cli_display()
+        self._update_scroll_region()
+
+    def _on_caption_style_changed(self, style_name: str):
+        self._render_visual_crop()
+        self._update_cli_display()
+        self._save_persistent_config()
 
     def _get_selected_font_size(self) -> int:
         val = self.size_menu.get() if hasattr(self, "size_menu") else "22"
@@ -1230,8 +1631,10 @@ class StudioClipperApp(ctk.CTk):
         else:
             desc = f"{self.current_scale:.2f}x (Scale Down / Fit {pct}%)"
         self.scale_label_var.set(f"Scale / Zoom: {desc}")
+        self._sync_to_active_config()
         self._render_visual_crop()
         self._update_cli_display()
+        self._update_scroll_region()
 
     def _on_pos_slider_changed(self, value: float, refresh=True):
         self.current_pos_x = round(float(value), 3)
@@ -1242,6 +1645,7 @@ class StudioClipperApp(ctk.CTk):
         elif pct > 50:
             label = f"Right ({pct}%)"
         self.pos_label_var.set(f"Horizontal Framing (X): {label}")
+        self._sync_to_active_config()
 
         if refresh:
             self._render_visual_crop()
@@ -1256,6 +1660,7 @@ class StudioClipperApp(ctk.CTk):
         elif pct > 50:
             label = f"Bottom ({pct}%)"
         self.pos_y_label_var.set(f"Vertical Framing (Y): {label}")
+        self._sync_to_active_config()
 
         if refresh:
             self._render_visual_crop()
@@ -1265,10 +1670,11 @@ class StudioClipperApp(ctk.CTk):
         self.current_vol = float(value)
         pct = int(round(self.current_vol * 100))
         self.vol_label_var.set(f"Background Volume: {pct}% (Speech stays crisp)")
+        self._sync_to_active_config()
         self._update_cli_display()
 
     def _render_visual_crop(self):
-        """Draws visual crop dynamically either as 9:16 Final Reel View or 16:9 Source Cutout View."""
+        """Draws visual crop dynamically supporting Shorts (9:16, 1:1, 4:5) and Videos (16:9, etc.)."""
         if not self.video_info:
             return
 
@@ -1288,28 +1694,56 @@ class StudioClipperApp(ctk.CTk):
 
         fade_status = "ON (🖤)" if self.bottom_fade_var.get() else "OFF"
         pad_status = f"Pad: T:{self.current_pad_top:.1f}% B:{self.current_pad_bottom:.1f}%"
+        mode_label = "📱 Shorts" if self.active_mode == "shorts" else "🎬 Videos"
         self.filter_info_label.configure(
-            text=f"FFmpeg: {crop_filter}\nFraming: Scale {self.current_scale:.2f}x | X {int(self.current_pos_x*100)}% | Y {int(self.current_pos_y*100)}% | {pad_status} | Fade: {fade_status}"
+            text=f"Mode: {mode_label} ({self.current_ratio}) | FFmpeg: {crop_filter}\nFraming: Scale {self.current_scale:.2f}x | X {int(self.current_pos_x*100)}% | Y {int(self.current_pos_y*100)}% | {pad_status} | Fade: {fade_status}"
         )
 
         target_display_w = 480
         target_display_h = 260
 
         if self.preview_mode == "reel":
-            # --- 📱 9:16 FINAL REEL PREVIEW ---
+            # --- FINAL FRAMED VIEW (Shorts or Videos) ---
             bg = Image.new("RGBA", (target_display_w, target_display_h), (18, 22, 32, 255))
             d_bg = ImageDraw.Draw(bg)
 
-            reel_h = 256
-            reel_w = int(reel_h * (9 / 16))
-            rx1 = (target_display_w - reel_w) // 2
-            rx2 = rx1 + reel_w
-            ry1 = 2
-            ry2 = ry1 + reel_h
+            # Determine target aspect ratio
+            r_str = str(self.current_ratio).strip().lower()
+            if r_str in ["16:9", "original", "none", "full"]:
+                target_aspect = 16.0 / 9.0
+            elif r_str == "9:16":
+                target_aspect = 9.0 / 16.0
+            elif r_str == "1:1":
+                target_aspect = 1.0
+            elif r_str == "4:5":
+                target_aspect = 4.0 / 5.0
+            elif ":" in r_str:
+                try:
+                    rw, rh = r_str.split(":")
+                    target_aspect = float(rw) / float(rh)
+                except Exception:
+                    target_aspect = 16.0 / 9.0 if self.active_mode == "videos" else 9.0 / 16.0
+            else:
+                target_aspect = 16.0 / 9.0 if self.active_mode == "videos" else 9.0 / 16.0
 
-            pad_t_px = int(round(reel_h * (self.current_pad_top / 100.0)))
-            pad_b_px = int(round(reel_h * (self.current_pad_bottom / 100.0)))
-            vid_disp_h = max(32, reel_h - pad_t_px - pad_b_px)
+            canvas_aspect = target_display_w / target_display_h
+            if target_aspect <= canvas_aspect:
+                frame_h = 252
+                frame_w = int(round(frame_h * target_aspect))
+                frame_w -= (frame_w % 2)
+            else:
+                frame_w = target_display_w - 24
+                frame_h = int(round(frame_w / target_aspect))
+                frame_h -= (frame_h % 2)
+
+            rx1 = (target_display_w - frame_w) // 2
+            rx2 = rx1 + frame_w
+            ry1 = (target_display_h - frame_h) // 2
+            ry2 = ry1 + frame_h
+
+            pad_t_px = int(round(frame_h * (self.current_pad_top / 100.0)))
+            pad_b_px = int(round(frame_h * (self.current_pad_bottom / 100.0)))
+            vid_disp_h = max(24, frame_h - pad_t_px - pad_b_px)
 
             self._preview_geom = {
                 "mode": "reel",
@@ -1321,8 +1755,8 @@ class StudioClipperApp(ctk.CTk):
                 "rx2": rx2,
                 "ry1": ry1,
                 "ry2": ry2,
-                "target_w": reel_w,
-                "target_h": reel_h
+                "target_w": frame_w,
+                "target_h": frame_h
             }
 
             d_bg.rectangle([rx1, ry1, rx2, ry2], fill=(0, 0, 0, 255))
@@ -1330,11 +1764,11 @@ class StudioClipperApp(ctk.CTk):
             if self.base_frame_image:
                 crop_box = (off_x, off_y, off_x + crop_w, off_y + crop_h)
                 try:
-                    cropped_frame = self.base_frame_image.crop(crop_box).resize((reel_w, vid_disp_h), Image.Resampling.LANCZOS)
+                    cropped_frame = self.base_frame_image.crop(crop_box).resize((frame_w, vid_disp_h), Image.Resampling.LANCZOS)
                 except Exception:
-                    cropped_frame = self.base_frame_image.resize((reel_w, vid_disp_h), Image.Resampling.LANCZOS)
+                    cropped_frame = self.base_frame_image.resize((frame_w, vid_disp_h), Image.Resampling.LANCZOS)
             else:
-                cropped_frame = Image.new("RGBA", (reel_w, vid_disp_h), (40, 50, 70, 255))
+                cropped_frame = Image.new("RGBA", (frame_w, vid_disp_h), (40, 50, 70, 255))
 
             bg.paste(cropped_frame, (rx1, ry1 + pad_t_px))
 
@@ -1347,7 +1781,7 @@ class StudioClipperApp(ctk.CTk):
                     norm = y_idx / max(1, fade_h - 1)
                     alpha = int(255 * self.fade_opacity * (norm ** 1.35))
                     col.putpixel((0, y_idx), (0, 0, 0, min(255, max(0, alpha))))
-                fade_img = col.resize((reel_w, fade_h), Image.Resampling.NEAREST)
+                fade_img = col.resize((frame_w, fade_h), Image.Resampling.NEAREST)
                 bg.paste(fade_img, (rx1, ry1 + pad_t_px + fade_top), fade_img)
 
             # Draw sample caption text on preview
@@ -1364,47 +1798,94 @@ class StudioClipperApp(ctk.CTk):
             try:
                 bbox = draw_cap.textbbox((0, 0), sample_text, font=cap_font)
                 tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
             except Exception:
                 tw = len(sample_text) * 7
+                th = 14
 
-            tx = rx1 + max(2, (reel_w - tw) // 2)
+            tx = rx1 + max(2, (frame_w - tw) // 2)
             in_black_bar = hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()
             if in_black_bar and pad_b_px > 16:
-                ty = ry1 + reel_h - max(12, int(pad_b_px / 2) + 6)
+                ty = ry1 + frame_h - max(12, int(pad_b_px / 2) + 6)
             else:
                 ty = ry1 + pad_t_px + vid_disp_h - max(12, int(vid_disp_h * 0.12))
 
-            for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
-                draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
-            txt_color = (255, 255, 0, 255) if "Yellow" in self.color_menu.get() else (255, 255, 255, 255)
-            draw_cap.text((tx, ty), sample_text, font=cap_font, fill=txt_color)
+            style_sel = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
+            if "Pill Box" in style_sel:
+                pill_pad_x = 8
+                pill_pad_y = 3
+                draw_cap.rounded_rectangle(
+                    [tx - pill_pad_x, ty - pill_pad_y, tx + tw + pill_pad_x, ty + th + pill_pad_y + 2],
+                    radius=5,
+                    fill=(10, 15, 25, 215),
+                    outline=(55, 65, 81, 255),
+                    width=1
+                )
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(255, 255, 255, 255))
+            elif "Soothe White" in style_sel:
+                for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1), (0, 2), (0, 3)]:
+                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(15, 23, 42, 170))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(255, 255, 255, 255))
+            elif "Yellow" in style_sel:
+                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(255, 240, 0, 255))
+            elif "Cyan" in style_sel or "Aqua" in style_sel:
+                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(34, 211, 238, 255))
+            elif "Golden" in style_sel:
+                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(255, 215, 58, 255))
+            elif "Lime" in style_sel:
+                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(126, 255, 50, 255))
+            else:
+                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(255, 255, 255, 255))
 
-            # Glowing Reel border
-            d_bg.rectangle([rx1, ry1, rx2, ry2], outline=(99, 102, 241, 255), width=2)
+            # Glowing frame outline
+            outline_col = (99, 102, 241, 255) if self.active_mode == "shorts" else (56, 189, 248, 255)
+            d_bg.rectangle([rx1, ry1, rx2, ry2], outline=outline_col, width=2)
 
-            # Draw side annotations
+            # Draw side or overlay annotations
             try:
                 side_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 11)
             except Exception:
                 side_font = ImageFont.load_default()
 
-            d_bg.text((12, 40), "📱 9:16 Final Reel", font=side_font, fill=(165, 180, 252, 255))
-            d_bg.text((12, 65), f"Top Pad: {self.current_pad_top:.1f}%", font=side_font, fill=(148, 163, 184, 255))
-            d_bg.text((12, 85), f"Bottom Pad: {self.current_pad_bottom:.1f}%", font=side_font, fill=(148, 163, 184, 255))
-            if self.current_pad_bottom > self.current_pad_top:
-                d_bg.text((12, 115), "⬆️ Shifted Upward", font=side_font, fill=(52, 211, 153, 255))
-            elif self.current_pad_top == 0 and self.current_pad_bottom == 0:
-                d_bg.text((12, 115), "↔️ Full Screen 9:16", font=side_font, fill=(148, 163, 184, 255))
+            mode_title = f"📱 Shorts ({self.current_ratio})" if self.active_mode == "shorts" else f"🎬 Videos ({self.current_ratio})"
 
-            rx_info = rx2 + 16
-            d_bg.text((rx_info, 40), f"Zoom: {self.current_scale:.2f}x", font=side_font, fill=(165, 180, 252, 255))
-            d_bg.text((rx_info, 65), f"Pan X: {int(self.current_pos_x*100)}%", font=side_font, fill=(148, 163, 184, 255))
-            d_bg.text((rx_info, 85), f"Pan Y: {int(self.current_pos_y*100)}%", font=side_font, fill=(148, 163, 184, 255))
-            d_bg.text((rx_info, 115), f"Fade: {fade_status}", font=side_font, fill=(96, 165, 250, 255) if self.bottom_fade_var.get() else (148, 163, 184, 255))
+            if target_aspect <= 1.0:
+                d_bg.text((12, 40), mode_title, font=side_font, fill=(165, 180, 252, 255))
+                d_bg.text((12, 65), f"Top Pad: {self.current_pad_top:.1f}%", font=side_font, fill=(148, 163, 184, 255))
+                d_bg.text((12, 85), f"Bottom Pad: {self.current_pad_bottom:.1f}%", font=side_font, fill=(148, 163, 184, 255))
+                if self.current_pad_bottom > self.current_pad_top:
+                    d_bg.text((12, 115), "⬆️ Shifted Upward", font=side_font, fill=(52, 211, 153, 255))
+                elif self.current_pad_top == 0 and self.current_pad_bottom == 0:
+                    d_bg.text((12, 115), "↔️ Full Screen", font=side_font, fill=(148, 163, 184, 255))
+
+                rx_info = rx2 + 16
+                d_bg.text((rx_info, 40), f"Zoom: {self.current_scale:.2f}x", font=side_font, fill=(165, 180, 252, 255))
+                d_bg.text((rx_info, 65), f"Pan X: {int(self.current_pos_x*100)}%", font=side_font, fill=(148, 163, 184, 255))
+                d_bg.text((rx_info, 85), f"Pan Y: {int(self.current_pos_y*100)}%", font=side_font, fill=(148, 163, 184, 255))
+                d_bg.text((rx_info, 115), f"Fade: {fade_status}", font=side_font, fill=(96, 165, 250, 255) if self.bottom_fade_var.get() else (148, 163, 184, 255))
+            else:
+                info_overlay = f"{mode_title} • Zoom {self.current_scale:.2f}x • Pan ({int(self.current_pos_x*100)}%, {int(self.current_pos_y*100)}%) • Pad (T:{self.current_pad_top:.0f}%, B:{self.current_pad_bottom:.0f}%) • Fade {fade_status}"
+                pill_w = min(target_display_w - 20, len(info_overlay) * 6 + 18)
+                px1 = (target_display_w - pill_w) // 2
+                px2 = px1 + pill_w
+                py1 = max(4, ry1 + 6)
+                py2 = py1 + 20
+                d_bg.rectangle([px1, py1, px2, py2], fill=(15, 23, 42, 220), outline=outline_col, width=1)
+                d_bg.text((px1 + 8, py1 + 3), info_overlay, font=side_font, fill=(224, 231, 255, 255))
 
             img_composite = bg.convert("RGB")
         else:
-            # --- 📐 16:9 SOURCE CUTOUT VIEW ---
+            # --- 📐 SOURCE CUTOUT VIEW ---
             disp_h = int(target_display_w * (in_h / in_w))
             if disp_h > 260:
                 disp_h = 260
@@ -1456,7 +1937,8 @@ class StudioClipperApp(ctk.CTk):
                 img_composite.paste(fade_box, (box_x1, fade_top), fade_box)
 
             draw_box = ImageDraw.Draw(img_composite)
-            draw_box.rectangle([box_x1, box_y1, box_x2, box_y2], outline=(99, 102, 241, 255), width=3)
+            box_col = (99, 102, 241, 255) if self.active_mode == "shorts" else (56, 189, 248, 255)
+            draw_box.rectangle([box_x1, box_y1, box_x2, box_y2], outline=box_col, width=3)
 
         ctk_img = ctk.CTkImage(light_image=img_composite, dark_image=img_composite, size=(target_display_w, target_display_h))
         self.canvas_label.configure(image=ctk_img, text="", cursor="hand2")
@@ -1467,41 +1949,48 @@ class StudioClipperApp(ctk.CTk):
     def _generate_command_string(self) -> str:
         vid = self.video_entry.get().strip() or "video.mp4"
         base, ext = os.path.splitext(vid)
-        out_name = f"{base}_{self.current_ratio.replace(':', '')}{ext or '.mp4'}"
+        self._sync_to_active_config()
+        active_cfg = self.shorts_config if self.active_mode == "shorts" else self.videos_config
+        tag = active_cfg["ratio_val"].replace(":", "")
+        out_name = f"{base}_{tag}_{self.active_mode}{ext or '.mp4'}"
 
         parts = [
             sys.executable,
             f'"{str(BASE_DIR / "process_full.py")}"',
             f'-v "{vid}"',
             f'-o "{out_name}"',
-            f'-r {self.current_ratio}',
-            f'--scale {self.current_scale:.2f}',
-            f'--pos-x {self.current_pos_x:.2f}',
-            f'--pos-y {self.current_pos_y:.2f}'
+            f'-r {active_cfg["ratio_val"]}',
+            f'--scale {active_cfg["scale"]:.2f}',
+            f'--pos-x {active_cfg["pos_x"]:.2f}',
+            f'--pos-y {active_cfg["pos_y"]:.2f}'
         ]
 
-        if self.current_pad_top > 0:
-            parts.append(f'--pad-top {self.current_pad_top:.1f}')
-        if self.current_pad_bottom > 0:
-            parts.append(f'--pad-bottom {self.current_pad_bottom:.1f}')
+        if active_cfg["pad_top"] > 0:
+            parts.append(f'--pad-top {active_cfg["pad_top"]:.1f}')
+        if active_cfg["pad_bottom"] > 0:
+            parts.append(f'--pad-bottom {active_cfg["pad_bottom"]:.1f}')
 
-        if self.bottom_fade_var.get():
+        if active_cfg["bottom_fade"]:
             parts.append('--bottom-fade')
+            fade_h = active_cfg.get("fade_height", self.fade_height)
+            fade_o = active_cfg.get("fade_opacity", self.fade_opacity)
+            parts.append(f'--fade-height {fade_h:.2f}')
+            parts.append(f'--fade-opacity {fade_o:.2f}')
 
         srt = self.srt_entry.get().strip()
         if self.sub_switch_var.get() and srt and os.path.exists(srt):
             parts.append(f'-s "{srt}"')
             f_size = self._get_selected_font_size()
             parts.append(f'--font-size {f_size}')
-            if "Yellow" in self.color_menu.get():
-                parts.append('--font-color "&H0000FFFF"')
+            cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
+            parts.append(f'--caption-style "{cap_style}"')
             if hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get():
                 parts.append('--sub-margin 35')
 
         music = self.music_entry.get().strip()
         if self.music_switch_var.get() and music and os.path.exists(music):
             parts.append(f'-m "{music}"')
-            parts.append(f'--volume {self.current_vol:.2f}')
+            parts.append(f'--volume {active_cfg["vol"]:.2f}')
 
         return " ".join(parts)
 
@@ -1529,7 +2018,9 @@ class StudioClipperApp(ctk.CTk):
 
         self.is_rendering = True
         self.btn_preview.configure(state="disabled")
-        self.status_label.configure(text="⚡ Generating 1-Min preview with Apple Silicon hardware acceleration...")
+        if hasattr(self, "btn_multi_preview"):
+            self.btn_multi_preview.configure(state="disabled")
+        self.status_label.configure(text=f"⚡ Generating 1-Min preview ({self.active_mode.capitalize()} mode)...")
         self.progress_bar.set(0.3)
 
         threading.Thread(target=self._run_preview_thread, daemon=True).start()
@@ -1539,17 +2030,28 @@ class StudioClipperApp(ctk.CTk):
             start_off = float(self.offset_entry.get().strip() or "0")
             preview_file = str(PREVIEW_DIR / f"preview_{int(time.time())}.mp4")
 
+            self._sync_to_active_config()
+            active_cfg = self.shorts_config if self.active_mode == "shorts" else self.videos_config
+            r_val = active_cfg["ratio_val"]
+
+            in_w = self.video_info.get("width", 1920)
+            in_h = self.video_info.get("height", 1080)
+            in_aspect = (in_w / in_h) if in_h else (16.0 / 9.0)
+
             # Crop filter
-            crop_filter, _, _, _, _ = compute_crop_filter(
-                in_w=self.video_info["width"],
-                in_h=self.video_info["height"],
-                ratio=self.current_ratio,
-                pos_x=self.current_pos_x,
-                pos_y=self.current_pos_y,
-                scale=self.current_scale,
-                pad_top=self.current_pad_top,
-                pad_bottom=self.current_pad_bottom
-            )
+            if (r_val in ["16:9", "original"]) and abs(in_aspect - (16.0 / 9.0)) < 0.02 and active_cfg["scale"] == 1.0 and active_cfg["pad_top"] == 0.0 and active_cfg["pad_bottom"] == 0.0 and active_cfg["pos_x"] == 0.5 and active_cfg["pos_y"] == 0.5:
+                crop_filter = None
+            else:
+                crop_filter, _, _, _, _ = compute_crop_filter(
+                    in_w=in_w,
+                    in_h=in_h,
+                    ratio=r_val,
+                    pos_x=active_cfg["pos_x"],
+                    pos_y=active_cfg["pos_y"],
+                    scale=active_cfg["scale"],
+                    pad_top=active_cfg["pad_top"],
+                    pad_bottom=active_cfg["pad_bottom"]
+                )
 
             srt = self.srt_entry.get().strip()
             use_srt = self.sub_switch_var.get() and srt and os.path.exists(srt)
@@ -1557,7 +2059,7 @@ class StudioClipperApp(ctk.CTk):
             music = self.music_entry.get().strip()
             use_music = self.music_switch_var.get() and music and os.path.exists(music)
 
-            font_col = "&H0000FFFF" if "Yellow" in self.color_menu.get() else "&H00FFFFFF"
+            cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
             font_sz = self._get_selected_font_size()
             sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
 
@@ -1567,15 +2069,15 @@ class StudioClipperApp(ctk.CTk):
                 crop_filter=crop_filter,
                 srt_path=srt if use_srt else None,
                 music_path=music if use_music else None,
-                music_volume=self.current_vol,
+                music_volume=active_cfg["vol"],
                 start_sec=start_off,
                 duration_sec=60.0,
                 use_hw_accel=True,
-                font_color=font_col,
+                caption_style=cap_style,
                 font_size=font_sz,
-                bottom_fade=self.bottom_fade_var.get(),
-                fade_height=self.fade_height,
-                fade_opacity=self.fade_opacity,
+                bottom_fade=active_cfg["bottom_fade"],
+                fade_height=active_cfg.get("fade_height", self.fade_height),
+                fade_opacity=active_cfg.get("fade_opacity", self.fade_opacity),
                 sub_margin_v=sub_marg
             )
 
@@ -1589,6 +2091,7 @@ class StudioClipperApp(ctk.CTk):
     def _on_preview_finished(self, preview_file: str):
         self.is_rendering = False
         self.btn_preview.configure(state="normal")
+        self.btn_multi_preview.configure(state="normal")
         self.progress_bar.set(1.0)
         self.status_label.configure(text=f"✅ Preview Ready! Opened in Mac player: {os.path.basename(preview_file)}")
 
@@ -1598,9 +2101,121 @@ class StudioClipperApp(ctk.CTk):
     def _on_preview_error(self, err_msg: str):
         self.is_rendering = False
         self.btn_preview.configure(state="normal")
+        self.btn_multi_preview.configure(state="normal")
         self.progress_bar.set(0)
         self.status_label.configure(text=f"❌ Preview Error")
         messagebox.showerror("Preview Failed", err_msg)
+
+    # ==============================================================
+    # 3-SEGMENT TEST PREVIEW (0%, 45%, 75% - 3 MIN COMBINED)
+    # ==============================================================
+    def _start_generate_multi_preview(self):
+        if not self.video_path or not os.path.exists(self.video_path):
+            messagebox.showwarning("Missing Video", "Please select a valid video file first.")
+            return
+
+        if self.is_rendering:
+            messagebox.showwarning("Busy", "A render job is already running.")
+            return
+
+        self.is_rendering = True
+        self.is_cancelled = False
+        self.btn_preview.configure(state="disabled")
+        self.btn_multi_preview.configure(state="disabled")
+        self.status_label.configure(text="⚡ Generating 3-Segment Preview (0%, 45%, 75% • 3 Min Combined)...")
+        self.progress_bar.set(0.1)
+
+        threading.Thread(target=self._run_multi_preview_thread, daemon=True).start()
+
+    def _run_multi_preview_thread(self):
+        try:
+            preview_file = str(PREVIEW_DIR / f"preview_3seg_{int(time.time())}.mp4")
+
+            self._sync_to_active_config()
+            active_cfg = self.shorts_config if self.active_mode == "shorts" else self.videos_config
+            r_val = active_cfg["ratio_val"]
+
+            in_w = self.video_info.get("width", 1920)
+            in_h = self.video_info.get("height", 1080)
+            in_aspect = (in_w / in_h) if in_h else (16.0 / 9.0)
+
+            if (r_val in ["16:9", "original"]) and abs(in_aspect - (16.0 / 9.0)) < 0.02 and active_cfg["scale"] == 1.0 and active_cfg["pad_top"] == 0.0 and active_cfg["pad_bottom"] == 0.0 and active_cfg["pos_x"] == 0.5 and active_cfg["pos_y"] == 0.5:
+                crop_filter = None
+            else:
+                crop_filter, _, _, _, _ = compute_crop_filter(
+                    in_w=in_w,
+                    in_h=in_h,
+                    ratio=r_val,
+                    pos_x=active_cfg["pos_x"],
+                    pos_y=active_cfg["pos_y"],
+                    scale=active_cfg["scale"],
+                    pad_top=active_cfg["pad_top"],
+                    pad_bottom=active_cfg["pad_bottom"]
+                )
+
+            srt = self.srt_entry.get().strip()
+            use_srt = self.sub_switch_var.get() and srt and os.path.exists(srt)
+
+            music = self.music_entry.get().strip()
+            use_music = self.music_switch_var.get() and music and os.path.exists(music)
+
+            cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
+            font_sz = self._get_selected_font_size()
+            sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
+
+            def cancel_checker():
+                return self.is_cancelled
+
+            def set_proc(p):
+                self.current_proc = p
+
+            def update_progress(seg_num, total_segs, seg_start, seg_dur, stage="rendering"):
+                if stage == "combining":
+                    pct = 0.92
+                    msg = "⚡ Combining 3 segments into final preview video..."
+                else:
+                    pct = 0.15 + (seg_num - 1) * 0.25
+                    pct_desc = "0% (Start)" if seg_num == 1 else ("45% (Middle)" if seg_num == 2 else "75% (Late)")
+                    m, s = divmod(int(seg_start), 60)
+                    msg = f"⚡ Rendering Segment {seg_num}/{total_segs} ({pct_desc} at {m:02d}:{s:02d}, {seg_dur:.0f}s)..."
+                self.after(0, lambda: self.status_label.configure(text=msg))
+                self.after(0, lambda: self.progress_bar.set(pct))
+
+            generate_3segment_preview(
+                video_path=self.video_path,
+                output_path=preview_file,
+                crop_filter=crop_filter,
+                srt_path=srt if use_srt else None,
+                music_path=music if use_music else None,
+                music_volume=active_cfg["vol"],
+                segment_duration=60.0,
+                percentages=(0.0, 0.45, 0.75),
+                use_hw_accel=True,
+                caption_style=cap_style,
+                font_size=font_sz,
+                bottom_fade=active_cfg["bottom_fade"],
+                fade_height=active_cfg.get("fade_height", self.fade_height),
+                fade_opacity=active_cfg.get("fade_opacity", self.fade_opacity),
+                sub_margin_v=sub_marg,
+                cancel_check=cancel_checker,
+                proc_callback=set_proc,
+                status_callback=update_progress
+            )
+
+            preview_path = preview_file
+            self.after(0, lambda p=preview_path: self._on_multi_preview_finished(p))
+
+        except Exception as e:
+            err_msg = str(e)
+            self.after(0, lambda err=err_msg: self._on_preview_error(err))
+
+    def _on_multi_preview_finished(self, preview_file: str):
+        self.is_rendering = False
+        self.btn_preview.configure(state="normal")
+        self.btn_multi_preview.configure(state="normal")
+        self.progress_bar.set(1.0)
+        self.status_label.configure(text=f"✅ 3-Segment Preview Ready (3 Min Combined)! Opened: {os.path.basename(preview_file)}")
+        subprocess.run(["open", preview_file], check=False)
 
     # ==============================================================
     # WHOLE VIDEO BACKGROUND RUNNER
@@ -1617,6 +2232,7 @@ class StudioClipperApp(ctk.CTk):
         self.is_rendering = True
         self.btn_run_full.configure(state="disabled")
         self.btn_preview.configure(state="disabled")
+        self.btn_multi_preview.configure(state="disabled")
         self.status_label.configure(text="🚀 Launching full-length video hardware encoding...")
         self.progress_bar.set(0.1)
 
@@ -1667,6 +2283,7 @@ class StudioClipperApp(ctk.CTk):
         self.is_rendering = False
         self.btn_run_full.configure(state="normal")
         self.btn_preview.configure(state="normal")
+        self.btn_multi_preview.configure(state="normal")
         self.progress_bar.set(1.0)
         self.status_label.configure(text="🎉 Full video completed successfully!")
         messagebox.showinfo("Render Complete", "Your full video has been processed at maximum hardware speed!")
@@ -1675,6 +2292,7 @@ class StudioClipperApp(ctk.CTk):
         self.is_rendering = False
         self.btn_run_full.configure(state="normal")
         self.btn_preview.configure(state="normal")
+        self.btn_multi_preview.configure(state="normal")
         self.progress_bar.set(0)
         self.status_label.configure(text="❌ Full Video Error")
         messagebox.showerror("Full Video Failed", err_msg)
@@ -1726,14 +2344,16 @@ class StudioClipperApp(ctk.CTk):
             entries = parse_timestamp_entries(text)
             shorts = [e for e in entries if e["duration"] <= 180]
             longs = [e for e in entries if e["duration"] > 180]
+            s_tag = self.shorts_config.get("ratio_val", "9:16")
+            v_tag = self.videos_config.get("ratio_val", "16:9")
             if longs:
                 self.batch_count_label.configure(
-                    text=f"Detected: {len(entries)} clips ({len(shorts)} Shorts, {len(longs)} Long 16:9)",
+                    text=f"Detected: {len(entries)} clips ({len(shorts)} Shorts [{s_tag}], {len(longs)} Videos [{v_tag}])",
                     text_color="#38bdf8"
                 )
             else:
                 self.batch_count_label.configure(
-                    text=f"Detected: {len(entries)} clips (All Shorts)",
+                    text=f"Detected: {len(entries)} clips (All Shorts [{s_tag}])",
                     text_color="#818cf8"
                 )
         except Exception:
@@ -1805,6 +2425,7 @@ class StudioClipperApp(ctk.CTk):
 
         self.btn_run_batch.configure(state="normal", text="🚀 Clip All Segments (Hardware Accelerated)")
         self.btn_preview.configure(state="normal")
+        self.btn_multi_preview.configure(state="normal")
         if hasattr(self, "btn_run_full"):
             self.btn_run_full.configure(state="normal")
 
@@ -1839,6 +2460,7 @@ class StudioClipperApp(ctk.CTk):
         self.current_proc = None
         self.btn_run_batch.configure(state="disabled")
         self.btn_preview.configure(state="disabled")
+        self.btn_multi_preview.configure(state="disabled")
         if hasattr(self, "btn_run_full"):
             self.btn_run_full.configure(state="disabled")
         self.batch_status_label.configure(text=f"🚀 Starting batch cut of {len(entries)} clips...", text_color="#818cf8")
@@ -1855,37 +2477,44 @@ class StudioClipperApp(ctk.CTk):
             in_h = self.video_info.get("height", 1080)
             in_aspect = (in_w / in_h) if in_h else (16.0 / 9.0)
 
-            # Pre-compute Shorts crop filter (user chosen ratio: 9:16 Shorts/Reels, 1:1, etc.)
+            # Ensure current active settings are synced
+            self._sync_to_active_config()
+
+            # Pre-compute Shorts crop filter from Shorts profile
+            s_cfg = self.shorts_config
             shorts_crop_filter, _, _, _, _ = compute_crop_filter(
                 in_w=in_w,
                 in_h=in_h,
-                ratio=self.current_ratio,
-                pos_x=self.current_pos_x,
-                pos_y=self.current_pos_y,
-                scale=self.current_scale,
-                pad_top=self.current_pad_top,
-                pad_bottom=self.current_pad_bottom
+                ratio=s_cfg["ratio_val"],
+                pos_x=s_cfg["pos_x"],
+                pos_y=s_cfg["pos_y"],
+                scale=s_cfg["scale"],
+                pad_top=s_cfg["pad_top"],
+                pad_bottom=s_cfg["pad_bottom"]
             )
 
-            # For long clips > 3 min: keep 16:9 unscaled original video (YouTube friendly)
-            # If video is already 16:9 (like 720p / 1080p), no crop is needed at all (crop_filter=None)
-            if abs(in_aspect - (16.0 / 9.0)) < 0.02:
-                yt_crop_filter = None
+            # Pre-compute Videos crop filter from Videos profile
+            v_cfg = self.videos_config
+            v_ratio = v_cfg["ratio_val"]
+            if (v_ratio in ["16:9", "original"]) and abs(in_aspect - (16.0 / 9.0)) < 0.02 and v_cfg["scale"] == 1.0 and v_cfg["pad_top"] == 0.0 and v_cfg["pad_bottom"] == 0.0 and v_cfg["pos_x"] == 0.5 and v_cfg["pos_y"] == 0.5:
+                videos_crop_filter = None
             else:
-                yt_crop_filter, _, _, _, _ = compute_crop_filter(
+                videos_crop_filter, _, _, _, _ = compute_crop_filter(
                     in_w=in_w,
                     in_h=in_h,
-                    ratio="16:9",
-                    pos_x=0.5,
-                    pos_y=0.5,
-                    scale=1.0
+                    ratio=v_ratio,
+                    pos_x=v_cfg["pos_x"],
+                    pos_y=v_cfg["pos_y"],
+                    scale=v_cfg["scale"],
+                    pad_top=v_cfg["pad_top"],
+                    pad_bottom=v_cfg["pad_bottom"]
                 )
 
             srt = self.srt_entry.get().strip()
             use_srt = self.sub_switch_var.get() and srt and os.path.exists(srt)
             music = self.music_entry.get().strip()
             use_music = self.music_switch_var.get() and music and os.path.exists(music)
-            font_col = "&H0000FFFF" if "Yellow" in self.color_menu.get() else "&H00FFFFFF"
+            cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
             font_sz = self._get_selected_font_size()
             sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
 
@@ -1920,13 +2549,19 @@ class StudioClipperApp(ctk.CTk):
                 is_long = dur > 180.0
 
                 if is_long:
-                    chosen_crop = yt_crop_filter
-                    ratio_tag = "16:9 Original (Unscaled)"
+                    chosen_crop = videos_crop_filter
+                    ratio_tag = f"{v_cfg['ratio_val']} Video"
                     dur_display = f"{dur/60:.1f}m"
+                    clip_fade = v_cfg["bottom_fade"]
+                    clip_fade_h = v_cfg.get("fade_height", 0.38)
+                    clip_fade_o = v_cfg.get("fade_opacity", 0.92)
                 else:
                     chosen_crop = shorts_crop_filter
-                    ratio_tag = f"{self.current_ratio} Shorts"
+                    ratio_tag = f"{s_cfg['ratio_val']} Shorts"
                     dur_display = f"{dur:.1f}s"
+                    clip_fade = s_cfg["bottom_fade"]
+                    clip_fade_h = s_cfg.get("fade_height", 0.38)
+                    clip_fade_o = s_cfg.get("fade_opacity", 0.92)
 
                 status_txt = f"[{idx}/{total}] 🎬 Cutting [{ratio_tag}]: {entry['title']} ({dur_display})..."
                 self.after(0, lambda p=progress_val, s=status_txt: self._update_batch_progress(p, s))
@@ -1937,7 +2572,7 @@ class StudioClipperApp(ctk.CTk):
                 def set_proc(p):
                     self.current_proc = p
 
-                # Render video clip with chosen ratio, music ducking & subtitles
+                # Render video clip with chosen ratio framing (1 & 2), and universal music & subtitles (3 & 4)
                 run_pipeline(
                     video_path=self.video_path,
                     output_path=str(out_vid),
@@ -1948,11 +2583,11 @@ class StudioClipperApp(ctk.CTk):
                     start_sec=entry["start_sec"],
                     duration_sec=dur,
                     use_hw_accel=True,
-                    font_color=font_col,
+                    caption_style=cap_style,
                     font_size=font_sz,
-                    bottom_fade=self.bottom_fade_var.get() and not is_long,
-                    fade_height=self.fade_height,
-                    fade_opacity=self.fade_opacity,
+                    bottom_fade=clip_fade,
+                    fade_height=clip_fade_h,
+                    fade_opacity=clip_fade_o,
                     sub_margin_v=sub_marg,
                     cancel_check=check_cancel,
                     proc_callback=set_proc
@@ -1983,6 +2618,7 @@ class StudioClipperApp(ctk.CTk):
         self.is_rendering = False
         self.btn_run_batch.configure(state="normal")
         self.btn_preview.configure(state="normal")
+        self.btn_multi_preview.configure(state="normal")
         if hasattr(self, "btn_run_full"):
             self.btn_run_full.configure(state="normal")
         self.batch_progress_bar.set(0)
@@ -1996,6 +2632,7 @@ class StudioClipperApp(ctk.CTk):
         self.is_rendering = False
         self.btn_run_batch.configure(state="normal")
         self.btn_preview.configure(state="normal")
+        self.btn_multi_preview.configure(state="normal")
         if hasattr(self, "btn_run_full"):
             self.btn_run_full.configure(state="normal")
         self.batch_progress_bar.set(1.0)
@@ -2007,6 +2644,7 @@ class StudioClipperApp(ctk.CTk):
         self.is_rendering = False
         self.btn_run_batch.configure(state="normal")
         self.btn_preview.configure(state="normal")
+        self.btn_multi_preview.configure(state="normal")
         if hasattr(self, "btn_run_full"):
             self.btn_run_full.configure(state="normal")
         self.batch_progress_bar.set(0)

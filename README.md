@@ -55,9 +55,9 @@ python3 studio_app.py
    - Adjust volume between 0% and 50% (default 12%).
    - Speech dialogue remains 100% crisp and clear using `amix` with `normalize=0`.
 
-5. **🎬 1-Minute Preview:**
-   - Click **"🎬 Generate 1-Min Preview"**.
-   - Generates in ~2-3 seconds using Apple Silicon VideoToolbox and automatically opens in your Mac's default video player (QuickTime Player) to review crop, sound balance, fade contrast, padding, and subtitles.
+5. **🎬 1-Minute & 3-Segment Combined Test Previews:**
+   - **🎬 1-Min Single Preview:** Click to render 1 minute starting from your offset.
+   - **🎞️ 3-Segment Test Preview (0%, 45%, 75% Combined):** Automatically extracts 1 minute from the **start (0%)**, 1 minute from the **middle (45%)**, and 1 minute from the **end (75%)**, combines all 3 into a single 3-minute video with your exact crop, padding, subtitles, and music, and opens in QuickTime Player!
 
 6. **🚀 Run on Whole Video (Even 10+ Hours Long) Without UI:**
    - The app automatically generates the exact terminal command.
@@ -67,6 +67,16 @@ python3 studio_app.py
 
 ## 💻 Standalone Headless Command Reference
 
+### Generate 3-Segment (0%, 45%, 75%) Combined Test Preview:
+```bash
+python3 process_full.py \
+  -v "/path/to/video.mp4" \
+  -o "preview_3segment_combined.mp4" \
+  -r 9:16 \
+  --multi-preview
+```
+
+### Full-Length Processing:
 ```bash
 python3 process_full.py \
   -v "/path/to/video.mp4" \
