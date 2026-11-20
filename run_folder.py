@@ -104,8 +104,10 @@ def run_folder_system(
     v_cfg = cfg["videos_config"]
     sub_cfg = cfg.get("subtitles", {})
     caption_style = sub_cfg.get("style", "✨ Soothe White Light (Soft Clean Glow)")
+    font_name = sub_cfg.get("font", "Kohinoor Devanagari")
     font_size_str = sub_cfg.get("size", "Medium (22pt)")
     font_size = int(''.join(c for c in font_size_str if c.isdigit()) or 22)
+    caption_border = sub_cfg.get("border", "Auto (Preset Default)")
     caption_pos = sub_cfg.get("position", "Caption: On Video Fade (Above Padding)")
 
     shorts_ratio = ratio or s_cfg["ratio_val"]
@@ -115,7 +117,7 @@ def run_folder_system(
     print("\n" + "=" * 65)
     print(f"📂 1-CLICK FOLDER AUTO-RUN: {folder.name}")
     print(f"⚙️  Using Saved Config: Shorts [{shorts_ratio}], Videos [{v_cfg['ratio_val']}]")
-    print(f"💬 Caption Style      : {caption_style} ({font_size}pt)")
+    print(f"💬 Caption Style      : {caption_style} | Font: {font_name} ({font_size}pt) | Border: {caption_border}")
     print(f"🎵 Background Music   : Universal Volume {int(round(universal_vol * 100))}%")
     print("=" * 65)
 
@@ -219,8 +221,10 @@ def run_folder_system(
             start_sec=entry["start_sec"],
             duration_sec=dur,
             use_hw_accel=True,
-            caption_style=caption_style,
+            font_name=font_name,
             font_size=font_size,
+            caption_style=caption_style,
+            caption_border=caption_border,
             bottom_fade=clip_fade,
             fade_height=clip_fade_h,
             fade_opacity=clip_fade_o,

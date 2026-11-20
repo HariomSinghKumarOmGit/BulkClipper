@@ -44,6 +44,74 @@ BASE_DIR = Path(__file__).resolve().parent
 PREVIEW_DIR = BASE_DIR / "offline_previews"
 PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
 
+AVAILABLE_FONTS = [
+    "Kohinoor Devanagari",
+    "Arial",
+    "Helvetica Neue",
+    "Impact",
+    "Avenir Next",
+    "Futura",
+    "Trebuchet MS",
+    "Verdana",
+    "Georgia",
+    "Devanagari MT",
+]
+
+BORDER_OPTIONS = [
+    "Auto (Preset Default)",
+    "No Border (Clean Text)",
+    "Small Border (Thin 1.0px)",
+    "Standard Border (Medium 2.0px)",
+    "Bold Border (Thick 3.2px)",
+    "Heavy Outline (Extra Thick 4.5px)",
+    "Opaque Box / Pill",
+]
+
+FONT_SIZE_OPTIONS = [
+    "14pt (Tiny)",
+    "16pt (Small)",
+    "18pt (Compact)",
+    "20pt (Standard)",
+    "22pt (Medium)",
+    "24pt (Medium+)",
+    "26pt (Large)",
+    "28pt (Large+)",
+    "30pt (Extra Large)",
+    "34pt (Huge)",
+    "38pt (Mega)",
+    "42pt (Jumbo)",
+]
+
+FONT_FILE_MAP = {
+    "Kohinoor Devanagari": ["/System/Library/Fonts/Kohinoor.ttc", "/System/Library/Fonts/KohinoorTelugu.ttc"],
+    "Arial": ["/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/ArialHB.ttc"],
+    "Helvetica Neue": ["/System/Library/Fonts/HelveticaNeue.ttc", "/System/Library/Fonts/Helvetica.ttc"],
+    "Impact": ["/System/Library/Fonts/Supplemental/Impact.ttf"],
+    "Avenir Next": ["/System/Library/Fonts/Avenir Next Condensed.ttc", "/System/Library/Fonts/Avenir.ttc"],
+    "Futura": ["/System/Library/Fonts/Supplemental/Futura.ttc"],
+    "Trebuchet MS": ["/System/Library/Fonts/Supplemental/Trebuchet MS.ttf"],
+    "Verdana": ["/System/Library/Fonts/Supplemental/Verdana.ttf"],
+    "Georgia": ["/System/Library/Fonts/Supplemental/Georgia.ttf"],
+    "Devanagari MT": ["/System/Library/Fonts/Supplemental/Devanagari Sangam MN.ttc", "/System/Library/Fonts/Supplemental/ITFDevanagari.ttc"],
+}
+
+
+def get_pillow_font(font_name: str, size: int) -> ImageFont.FreeTypeFont:
+    paths = FONT_FILE_MAP.get(font_name, []) + [
+        "/System/Library/Fonts/Kohinoor.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
 
 class StudioClipperApp(ctk.CTk):
     def __init__(self):
@@ -82,7 +150,9 @@ class StudioClipperApp(ctk.CTk):
         # Universal Sections 3 (Subtitles) & 4 (Music & Volume)
         sub_cfg = saved_cfg.get("subtitles", {})
         self.saved_caption_style = sub_cfg.get("style", "✨ Soothe White Light (Soft Clean Glow)")
+        self.saved_font_name = sub_cfg.get("font", "Kohinoor Devanagari")
         self.saved_font_size = sub_cfg.get("size", "Medium (22pt)")
+        self.saved_caption_border = sub_cfg.get("border", "Auto (Preset Default)")
         self.saved_caption_pos = sub_cfg.get("position", "Caption: On Video Fade (Above Padding)")
         self.saved_sub_enabled = sub_cfg.get("enabled", True)
         self.saved_srt_path = sub_cfg.get("path", "")
@@ -640,26 +710,113 @@ class StudioClipperApp(ctk.CTk):
             self.caption_style_menu.set("✨ Soothe White Light (Soft Clean Glow)")
         self.caption_style_menu.pack(fill="x", pady=(0, 8))
 
-        # Subtitle Size & Vertical Placement
-        sub_opts_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
-        sub_opts_frame.pack(fill="x", pady=(0, 14))
+        # Font Family & Border Options Row
+        font_border_row = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        font_border_row.pack(fill="x", pady=(0, 8))
+
+        # Font column
+        font_col = ctk.CTkFrame(font_border_row, fg_color="transparent")
+        font_col.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ctk.CTkLabel(font_col, text="Caption Font Family:", font=ctk.CTkFont(size=11, weight="bold"), text_color="#cbd5e1").pack(anchor="w", pady=(0, 2))
+        self.font_menu = ctk.CTkOptionMenu(
+            font_col,
+            values=AVAILABLE_FONTS,
+            command=lambda _: (self._render_visual_crop(), self._update_cli_display(), self._save_persistent_config())
+        )
+        if getattr(self, "saved_font_name", None) in AVAILABLE_FONTS:
+            self.font_menu.set(self.saved_font_name)
+        else:
+            self.font_menu.set("Kohinoor Devanagari")
+        self.font_menu.pack(fill="x")
+
+        # Border column
+        border_col = ctk.CTkFrame(font_border_row, fg_color="transparent")
+        border_col.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ctk.CTkLabel(border_col, text="Caption Border / Outline:", font=ctk.CTkFont(size=11, weight="bold"), text_color="#cbd5e1").pack(anchor="w", pady=(0, 2))
+        self.border_menu = ctk.CTkOptionMenu(
+            border_col,
+            values=BORDER_OPTIONS,
+            command=lambda _: (self._render_visual_crop(), self._update_cli_display(), self._save_persistent_config())
+        )
+        if getattr(self, "saved_caption_border", None) in BORDER_OPTIONS:
+            self.border_menu.set(self.saved_caption_border)
+        else:
+            self.border_menu.set("Auto (Preset Default)")
+        self.border_menu.pack(fill="x")
+
+        # Caption Size (with [-] and [+] nudge buttons) & Vertical Placement Row
+        size_pos_row = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        size_pos_row.pack(fill="x", pady=(0, 14))
+
+        # Size Column
+        size_col = ctk.CTkFrame(size_pos_row, fg_color="transparent")
+        size_col.pack(side="left", fill="x", expand=False, padx=(0, 8))
+        ctk.CTkLabel(size_col, text="Caption Size:", font=ctk.CTkFont(size=11, weight="bold"), text_color="#cbd5e1").pack(anchor="w", pady=(0, 2))
+
+        size_ctrl_box = ctk.CTkFrame(size_col, fg_color="transparent")
+        size_ctrl_box.pack(fill="x")
+
+        self.btn_size_minus = ctk.CTkButton(
+            size_ctrl_box,
+            text="-",
+            width=28,
+            height=28,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#2b3245",
+            hover_color="#3b445c",
+            corner_radius=6
+        )
+        self.btn_size_minus.pack(side="left", padx=(0, 4))
 
         self.size_menu = ctk.CTkOptionMenu(
-            sub_opts_frame,
-            values=["Compact (18pt)", "Medium (22pt)", "Large (26pt)", "Extra Large (30pt)"],
-            width=135,
-            command=lambda _: (self._update_cli_display(), self._save_persistent_config())
+            size_ctrl_box,
+            values=FONT_SIZE_OPTIONS,
+            width=132,
+            command=lambda _: (self._render_visual_crop(), self._update_cli_display(), self._save_persistent_config())
         )
-        self.size_menu.set(self.saved_font_size)
-        self.size_menu.pack(side="left", padx=(0, 8))
+        # Restore saved font size matching FONT_SIZE_OPTIONS
+        init_size = self.saved_font_size if hasattr(self, "saved_font_size") else "Medium (22pt)"
+        matched_init = False
+        for opt in FONT_SIZE_OPTIONS:
+            if init_size in opt or opt in init_size:
+                self.size_menu.set(opt)
+                matched_init = True
+                break
+        if not matched_init:
+            digits = ''.join(c for c in init_size if c.isdigit())
+            if digits:
+                self.size_menu.set(f"{digits}pt")
+            else:
+                self.size_menu.set("22pt (Medium)")
+        self.size_menu.pack(side="left", padx=(0, 4))
+
+        self.btn_size_plus = ctk.CTkButton(
+            size_ctrl_box,
+            text="+",
+            width=28,
+            height=28,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#2b3245",
+            hover_color="#3b445c",
+            corner_radius=6
+        )
+        self.btn_size_plus.pack(side="left")
+
+        self._attach_button_repeat(self.btn_size_minus, lambda: self._step_font_size(-2))
+        self._attach_button_repeat(self.btn_size_plus, lambda: self._step_font_size(2))
+
+        # Position Column
+        pos_col = ctk.CTkFrame(size_pos_row, fg_color="transparent")
+        pos_col.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(pos_col, text="Vertical Placement:", font=ctk.CTkFont(size=11, weight="bold"), text_color="#cbd5e1").pack(anchor="w", pady=(0, 2))
 
         self.caption_pos_menu = ctk.CTkOptionMenu(
-            sub_opts_frame,
+            pos_col,
             values=["Caption: On Video Fade (Above Padding)", "Caption: Inside Black Bottom Bar"],
             command=lambda _: (self._render_visual_crop(), self._update_cli_display(), self._save_persistent_config())
         )
         self.caption_pos_menu.set(self.saved_caption_pos)
-        self.caption_pos_menu.pack(side="left", fill="x", expand=True)
+        self.caption_pos_menu.pack(fill="x")
 
         # 4. Background Music & Ducking
         self._create_section_label(self.left_frame, "4. Background Music & Ducking (.mp3, .wav)")
@@ -1051,6 +1208,8 @@ class StudioClipperApp(ctk.CTk):
         try:
             cmd = [
                 "ffmpeg", "-y",
+                "-err_detect", "ignore_err",
+                "-max_error_rate", "1.0",
                 "-ss", "00:00:03",
                 "-i", video_path,
                 "-frames:v", "1",
@@ -1122,7 +1281,9 @@ class StudioClipperApp(ctk.CTk):
         """Saves current state into clipper_config.json so it persists across restarts and folder runs."""
         try:
             cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else getattr(self, "saved_caption_style", "✨ Soothe White Light (Soft Clean Glow)")
+            cap_font = self._get_selected_font_name()
             cap_size = self.size_menu.get() if hasattr(self, "size_menu") else getattr(self, "saved_font_size", "Medium (22pt)")
+            cap_border = self._get_selected_caption_border()
             cap_pos = self.caption_pos_menu.get() if hasattr(self, "caption_pos_menu") else getattr(self, "saved_caption_pos", "Caption: On Video Fade (Above Padding)")
             sub_on = self.sub_switch_var.get() if hasattr(self, "sub_switch_var") else True
             music_on = self.music_switch_var.get() if hasattr(self, "music_switch_var") else True
@@ -1137,7 +1298,9 @@ class StudioClipperApp(ctk.CTk):
                     "enabled": sub_on,
                     "path": getattr(self, "srt_path", "") or "",
                     "style": cap_style,
+                    "font": cap_font,
                     "size": cap_size,
+                    "border": cap_border,
                     "position": cap_pos
                 },
                 # Section 4: Universal Music & Volume Configuration
@@ -1469,13 +1632,47 @@ class StudioClipperApp(ctk.CTk):
 
     def _get_selected_font_size(self) -> int:
         val = self.size_menu.get() if hasattr(self, "size_menu") else "22"
-        if "18" in val:
-            return 18
-        elif "26" in val:
-            return 26
-        elif "30" in val:
-            return 30
+        digits = ''.join(c for c in val if c.isdigit())
+        if digits:
+            try:
+                sz = int(digits)
+                if 10 <= sz <= 72:
+                    return sz
+            except Exception:
+                pass
         return 22
+
+    def _get_selected_font_name(self) -> str:
+        if hasattr(self, "font_menu"):
+            return self.font_menu.get().strip()
+        return getattr(self, "saved_font_name", "Kohinoor Devanagari")
+
+    def _get_selected_caption_border(self) -> str:
+        if hasattr(self, "border_menu"):
+            return self.border_menu.get().strip()
+        return getattr(self, "saved_caption_border", "Auto (Preset Default)")
+
+    def _step_font_size(self, delta: int):
+        cur_sz = self._get_selected_font_size()
+        new_sz = max(12, min(50, cur_sz + delta))
+
+        matching_label = None
+        for opt in FONT_SIZE_OPTIONS:
+            if f"{new_sz}pt" in opt:
+                matching_label = opt
+                break
+        if not matching_label:
+            matching_label = f"{new_sz}pt"
+            vals = list(self.size_menu.cget("values"))
+            if matching_label not in vals:
+                vals.append(matching_label)
+                vals.sort(key=lambda s: int(''.join(c for c in s if c.isdigit()) or 0))
+                self.size_menu.configure(values=vals)
+
+        self.size_menu.set(matching_label)
+        self._render_visual_crop()
+        self._update_cli_display()
+        self._save_persistent_config()
 
     def _vol_step_minus(self):
         new_val = max(0.0, min(0.5, round(self.vol_slider.get() - 0.01, 2)))
@@ -1787,65 +1984,96 @@ class StudioClipperApp(ctk.CTk):
             # Draw sample caption text on preview
             draw_cap = ImageDraw.Draw(bg)
             sample_text = "सिद्धि तो है। हम बढ़ रहे हैं"
-            try:
-                cap_font = ImageFont.truetype("/System/Library/Fonts/Kohinoor.ttc", 13)
-            except Exception:
+
+            font_nm = self._get_selected_font_name()
+            font_sz = self._get_selected_font_size()
+            cap_border = self._get_selected_caption_border()
+
+            # Proportionally scale font size to preview frame height (base 22pt -> ~13pt at frame_h=252)
+            preview_font_sz = max(8, min(36, int(round(font_sz * (frame_h / 420.0)))))
+            cap_font = get_pillow_font(font_nm, preview_font_sz)
+            if not cap_font:
                 try:
-                    cap_font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 12)
-                except Exception:
                     cap_font = ImageFont.load_default()
+                except Exception:
+                    cap_font = None
 
             try:
                 bbox = draw_cap.textbbox((0, 0), sample_text, font=cap_font)
                 tw = bbox[2] - bbox[0]
                 th = bbox[3] - bbox[1]
             except Exception:
-                tw = len(sample_text) * 7
-                th = 14
+                tw = len(sample_text) * int(preview_font_sz * 0.6)
+                th = preview_font_sz + 4
 
             tx = rx1 + max(2, (frame_w - tw) // 2)
             in_black_bar = hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()
             if in_black_bar and pad_b_px > 16:
-                ty = ry1 + frame_h - max(12, int(pad_b_px / 2) + 6)
+                ty = ry1 + frame_h - max(12, int(pad_b_px / 2) + int(th / 2))
             else:
-                ty = ry1 + pad_t_px + vid_disp_h - max(12, int(vid_disp_h * 0.12))
+                ty = ry1 + pad_t_px + vid_disp_h - max(12, int(vid_disp_h * 0.12) + int(th / 2))
 
             style_sel = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
-            if "Pill Box" in style_sel:
-                pill_pad_x = 8
-                pill_pad_y = 3
+
+            # Primary text color from style preset
+            if "Yellow" in style_sel:
+                text_col = (255, 240, 0, 255)
+            elif "Cyan" in style_sel or "Aqua" in style_sel:
+                text_col = (34, 211, 238, 255)
+            elif "Golden" in style_sel:
+                text_col = (255, 215, 58, 255)
+            elif "Lime" in style_sel:
+                text_col = (126, 255, 50, 255)
+            else:
+                text_col = (255, 255, 255, 255)
+
+            # Determine border styling
+            cb_lower = cap_border.lower()
+            is_box = "box" in cb_lower or "pill" in cb_lower or ("auto" in cb_lower and "pill box" in style_sel.lower())
+            is_no_border = "no border" in cb_lower or "none" in cb_lower
+            is_small = "small" in cb_lower or "thin" in cb_lower or "1.0" in cb_lower
+            is_bold = "bold" in cb_lower or "thick" in cb_lower or "3.2" in cb_lower
+            is_heavy = "heavy" in cb_lower or "extra thick" in cb_lower or "4.5" in cb_lower
+
+            if is_box:
+                pill_pad_x = max(6, int(preview_font_sz * 0.6))
+                pill_pad_y = max(3, int(preview_font_sz * 0.25))
                 draw_cap.rounded_rectangle(
                     [tx - pill_pad_x, ty - pill_pad_y, tx + tw + pill_pad_x, ty + th + pill_pad_y + 2],
-                    radius=5,
+                    radius=max(3, int(preview_font_sz * 0.4)),
                     fill=(10, 15, 25, 215),
                     outline=(55, 65, 81, 255),
                     width=1
                 )
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(255, 255, 255, 255))
-            elif "Soothe White" in style_sel:
-                for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1), (0, 2), (0, 3)]:
-                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(15, 23, 42, 170))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(255, 255, 255, 255))
-            elif "Yellow" in style_sel:
-                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
-                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(255, 240, 0, 255))
-            elif "Cyan" in style_sel or "Aqua" in style_sel:
-                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
-                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(34, 211, 238, 255))
-            elif "Golden" in style_sel:
-                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
-                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(255, 215, 58, 255))
-            elif "Lime" in style_sel:
-                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
-                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(126, 255, 50, 255))
-            else:
-                for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
-                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=(255, 255, 255, 255))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
+            elif is_no_border:
+                # Clean text with soft 1px shadow
+                draw_cap.text((tx + 1, ty + 1), sample_text, font=cap_font, fill=(0, 0, 0, 90))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
+            elif is_small:
+                for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 220))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
+            elif is_bold:
+                for ox in range(-2, 3):
+                    for oy in range(-2, 3):
+                        if ox != 0 or oy != 0:
+                            draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
+            elif is_heavy:
+                for ox in range(-3, 4):
+                    for oy in range(-3, 4):
+                        if ox * ox + oy * oy <= 9 and (ox != 0 or oy != 0):
+                            draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
+            else:  # Standard / Medium or Auto Preset
+                if "Soothe White" in style_sel and "auto" in cb_lower:
+                    for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1), (0, 2), (0, 3)]:
+                        draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(15, 23, 42, 170))
+                else:
+                    for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
+                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
 
             # Glowing frame outline
             outline_col = (99, 102, 241, 255) if self.active_mode == "shorts" else (56, 189, 248, 255)
@@ -1980,10 +2208,14 @@ class StudioClipperApp(ctk.CTk):
         srt = self.srt_entry.get().strip()
         if self.sub_switch_var.get() and srt and os.path.exists(srt):
             parts.append(f'-s "{srt}"')
+            font_nm = self._get_selected_font_name()
+            parts.append(f'--font "{font_nm}"')
             f_size = self._get_selected_font_size()
             parts.append(f'--font-size {f_size}')
             cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
             parts.append(f'--caption-style "{cap_style}"')
+            cap_border = self._get_selected_caption_border()
+            parts.append(f'--caption-border "{cap_border}"')
             if hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get():
                 parts.append('--sub-margin 35')
 
@@ -2060,7 +2292,9 @@ class StudioClipperApp(ctk.CTk):
             use_music = self.music_switch_var.get() and music and os.path.exists(music)
 
             cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
+            font_nm = self._get_selected_font_name()
             font_sz = self._get_selected_font_size()
+            cap_border = self._get_selected_caption_border()
             sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
 
             run_pipeline(
@@ -2073,8 +2307,10 @@ class StudioClipperApp(ctk.CTk):
                 start_sec=start_off,
                 duration_sec=60.0,
                 use_hw_accel=True,
-                caption_style=cap_style,
+                font_name=font_nm,
                 font_size=font_sz,
+                caption_style=cap_style,
+                caption_border=cap_border,
                 bottom_fade=active_cfg["bottom_fade"],
                 fade_height=active_cfg.get("fade_height", self.fade_height),
                 fade_opacity=active_cfg.get("fade_opacity", self.fade_opacity),
@@ -2160,7 +2396,9 @@ class StudioClipperApp(ctk.CTk):
             use_music = self.music_switch_var.get() and music and os.path.exists(music)
 
             cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
+            font_nm = self._get_selected_font_name()
             font_sz = self._get_selected_font_size()
+            cap_border = self._get_selected_caption_border()
             sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
 
             def cancel_checker():
@@ -2192,7 +2430,9 @@ class StudioClipperApp(ctk.CTk):
                 percentages=(0.0, 0.45, 0.75),
                 use_hw_accel=True,
                 caption_style=cap_style,
+                font_name=font_nm,
                 font_size=font_sz,
+                caption_border=cap_border,
                 bottom_fade=active_cfg["bottom_fade"],
                 fade_height=active_cfg.get("fade_height", self.fade_height),
                 fade_opacity=active_cfg.get("fade_opacity", self.fade_opacity),
@@ -2515,7 +2755,9 @@ class StudioClipperApp(ctk.CTk):
             music = self.music_entry.get().strip()
             use_music = self.music_switch_var.get() and music and os.path.exists(music)
             cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
+            font_nm = self._get_selected_font_name()
             font_sz = self._get_selected_font_size()
+            cap_border = self._get_selected_caption_border()
             sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
 
             total = len(entries)
@@ -2584,7 +2826,9 @@ class StudioClipperApp(ctk.CTk):
                     duration_sec=dur,
                     use_hw_accel=True,
                     caption_style=cap_style,
+                    font_name=font_nm,
                     font_size=font_sz,
+                    caption_border=cap_border,
                     bottom_fade=clip_fade,
                     fade_height=clip_fade_h,
                     fade_opacity=clip_fade_o,

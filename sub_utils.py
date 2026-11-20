@@ -96,7 +96,13 @@ def load_any_subtitles(file_path: str) -> pysrt.SubRipFile:
             tmp_srt = tmp.name
 
         try:
-            cmd = ["ffmpeg", "-y", "-i", file_path, tmp_srt]
+            cmd = [
+                "ffmpeg", "-y",
+                "-err_detect", "ignore_err",
+                "-max_error_rate", "1.0",
+                "-i", file_path,
+                tmp_srt
+            ]
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode == 0 and os.path.exists(tmp_srt):
                 subs = pysrt.open(tmp_srt, encoding="utf-8")

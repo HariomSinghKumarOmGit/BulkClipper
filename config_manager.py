@@ -50,7 +50,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": True,
         "path": "",
         "style": "✨ Soothe White Light (Soft Clean Glow)",
+        "font": "Kohinoor Devanagari",
         "size": "Medium (22pt)",
+        "border": "Auto (Preset Default)",
         "position": "Caption: On Video Fade (Above Padding)"
     },
     "music": {

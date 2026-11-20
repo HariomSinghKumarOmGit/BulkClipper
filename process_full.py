@@ -50,13 +50,40 @@ def probe_video(video_path: str) -> Dict[str, Any]:
     width = int(v_stream.get("width", 0))
     height = int(v_stream.get("height", 0))
     has_audio = any(s.get("codec_type") == "audio" for s in data.get("streams", []))
-    duration = float(data.get("format", {}).get("duration", 0.0))
+
+    v_dur = 0.0
+    try:
+        raw_vd = v_stream.get("duration")
+        if raw_vd not in [None, "N/A", ""]:
+            v_dur = float(raw_vd)
+    except (ValueError, TypeError):
+        pass
+
+    fmt_dur = 0.0
+    try:
+        raw_fd = data.get("format", {}).get("duration")
+        if raw_fd not in [None, "N/A", ""]:
+            fmt_dur = float(raw_fd)
+    except (ValueError, TypeError):
+        pass
+
+    # Video processing (crop, scale, seek, preview) cannot exceed available video frames.
+    # If the video stream is shorter than the container/audio duration (common in YouTube livestream downloads),
+    # use the video stream's duration to prevent seeking past EOF and crashing FFmpeg.
+    if v_dur > 0 and fmt_dur > 0:
+        duration = min(v_dur, fmt_dur)
+    elif v_dur > 0:
+        duration = v_dur
+    else:
+        duration = fmt_dur
     
     return {
         "width": width,
         "height": height,
         "has_audio": has_audio,
-        "duration": duration
+        "duration": duration,
+        "video_duration": v_dur,
+        "format_duration": fmt_dur
     }
 
 
@@ -140,9 +167,10 @@ def build_ass_style(
     font_name: str = "Kohinoor Devanagari",
     font_size: int = 22,
     margin_v: int = 35,
-    fallback_color: Optional[str] = None
+    fallback_color: Optional[str] = None,
+    caption_border: Optional[str] = None
 ) -> str:
-    """Builds an ASS force_style string based on caption style preset."""
+    """Builds an ASS force_style string based on caption style preset and custom border/font."""
     chosen_style = None
     if style_name:
         for k, v in CAPTION_STYLES.items():
@@ -162,6 +190,34 @@ def build_ass_style(
     outline = chosen_style.get("Outline", 2.0)
     shadow = chosen_style.get("Shadow", 1.0)
     bold = chosen_style.get("Bold", 1)
+
+    if caption_border:
+        cb_lower = caption_border.lower()
+        if "no border" in cb_lower or "none" in cb_lower or "zero" in cb_lower:
+            outline = 0.0
+            shadow = 0.5
+            border_style = 1
+        elif "small" in cb_lower or "thin" in cb_lower or "1.0" in cb_lower:
+            outline = 1.0
+            shadow = 1.0
+            border_style = 1
+        elif "standard" in cb_lower or "medium" in cb_lower or "2.0" in cb_lower:
+            outline = 2.0
+            shadow = 1.5
+            border_style = 1
+        elif "bold" in cb_lower or "thick" in cb_lower or "3.2" in cb_lower:
+            outline = 3.2
+            shadow = 2.0
+            border_style = 1
+        elif "heavy" in cb_lower or "extra thick" in cb_lower or "4.5" in cb_lower:
+            outline = 4.5
+            shadow = 2.5
+            border_style = 1
+        elif "box" in cb_lower or "pill" in cb_lower or "bar" in cb_lower:
+            border_style = 3
+            outline = 1.0
+            shadow = 0.0
+            back_col = "&H85000000"
 
     parts = [
         f"FontName={font_name}",
@@ -424,6 +480,7 @@ def run_pipeline(
     font_size: int = 22,
     font_color: str = "&H00FFFFFF",
     caption_style: Optional[str] = None,
+    caption_border: Optional[str] = None,
     bitrate: str = "5000k",
     bottom_fade: bool = False,
     fade_height: float = 0.38,
@@ -436,6 +493,16 @@ def run_pipeline(
     check_dependencies()
     v_info = probe_video(video_path)
     total_dur = v_info["duration"]
+
+    if total_dur > 0 and start_sec is not None and start_sec >= total_dur:
+        raise ValueError(
+            f"Requested seek start time ({start_sec:.1f}s) is at or beyond the video stream duration ({total_dur:.1f}s)."
+        )
+    if total_dur > 0 and start_sec is not None and duration_sec is not None:
+        rem_sec = max(1.0, total_dur - start_sec)
+        if duration_sec > rem_sec:
+            duration_sec = rem_sec
+
     has_vid_audio = v_info["has_audio"]
     has_music = music_path and os.path.exists(music_path) and music_volume > 0
     has_srt = srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 0
@@ -443,19 +510,7 @@ def run_pipeline(
     encoders = get_available_encoders()
     hw_enabled = use_hw_accel and encoders.get("videotoolbox", False)
 
-    # 1. Inputs
-    cmd = ["ffmpeg", "-y"]
-    if start_sec is not None and start_sec > 0:
-        cmd.extend(["-ss", f"{start_sec:.3f}"])
-    if duration_sec is not None and duration_sec > 0:
-        cmd.extend(["-t", f"{duration_sec:.3f}"])
-
-    cmd.extend(["-i", video_path])
-
-    if has_music:
-        cmd.extend(["-stream_loop", "-1", "-i", music_path])
-
-    # 2. Video Filters (Crop -> Bottom Black Fade -> Subtitles)
+    # 1. Inputs & Filters Setup
     temp_shifted_srt = None
     burn_file = None
     if has_srt:
@@ -521,7 +576,8 @@ def run_pipeline(
                 font_name=font_name,
                 font_size=font_size,
                 margin_v=final_margin_v,
-                fallback_color=font_color
+                fallback_color=font_color,
+                caption_border=caption_border
             )
             sub_filter = f"subtitles='{escaped_sub}':force_style='{style}'"
         filter_complex_parts.append(f"[{v_curr}]{sub_filter}[v_sub]")
@@ -532,47 +588,67 @@ def run_pipeline(
     else:
         video_map = "0:v"
 
-    # 3. Audio Filters (Mix main voice + ducked background music)
+    # 3. Audio Filters (Mix main voice + ducked background music with robust timestamp resample)
     if has_music and has_vid_audio:
+        filter_complex_parts.append("[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a0_clean]")
         filter_complex_parts.append(f"[1:a]volume={music_volume:.3f}[bg_ducked]")
-        filter_complex_parts.append(f"[0:a][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]")
+        filter_complex_parts.append("[a0_clean][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]")
         audio_map = "[a_out]"
     elif has_music and not has_vid_audio:
         filter_complex_parts.append(f"[1:a]volume={music_volume:.3f}[a_out]")
         audio_map = "[a_out]"
     elif not has_music and has_vid_audio:
-        audio_map = "0:a"
+        filter_complex_parts.append("[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a_out]")
+        audio_map = "[a_out]"
     else:
         audio_map = None
 
-    if filter_complex_parts:
-        cmd.extend(["-filter_complex", ";".join(filter_complex_parts)])
+    def _build_ffmpeg_cmd(seek_mode: str = "fast") -> list:
+        c = [
+            "ffmpeg", "-y",
+            "-err_detect", "ignore_err",
+            "-max_error_rate", "1.0",
+            "-fflags", "+genpts+discardcorrupt"
+        ]
+        if seek_mode == "fast" and start_sec is not None and start_sec > 0:
+            c.extend(["-ss", f"{start_sec:.3f}"])
+        c.extend(["-i", video_path])
 
-    cmd.extend(["-map", video_map])
-    if audio_map:
-        cmd.extend(["-map", audio_map])
+        if has_music:
+            c.extend(["-stream_loop", "-1", "-i", music_path])
 
-    # 4. Encoding Configuration
-    if hw_enabled:
-        print("⚡ Using Apple Silicon Hardware Acceleration (h264_videotoolbox)")
-        cmd.extend([
-            "-c:v", "h264_videotoolbox",
-            "-b:v", bitrate,
-            "-pix_fmt", "yuv420p"
-        ])
-    else:
-        print("💻 Using CPU Encoder (libx264 veryfast)")
-        cmd.extend([
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "20",
-            "-pix_fmt", "yuv420p"
-        ])
+        if seek_mode == "safe" and start_sec is not None and start_sec > 0:
+            c.extend(["-ss", f"{start_sec:.3f}"])
 
-    if audio_map:
-        cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+        if filter_complex_parts:
+            c.extend(["-filter_complex", ";".join(filter_complex_parts)])
 
-    cmd.extend(["-shortest", output_path])
+        c.extend(["-map", video_map])
+        if audio_map:
+            c.extend(["-map", audio_map])
+
+        if hw_enabled:
+            c.extend([
+                "-c:v", "h264_videotoolbox",
+                "-b:v", bitrate,
+                "-pix_fmt", "yuv420p"
+            ])
+        else:
+            c.extend([
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "20",
+                "-pix_fmt", "yuv420p"
+            ])
+
+        if audio_map:
+            c.extend(["-c:a", "aac", "-b:a", "192k"])
+
+        if duration_sec is not None and duration_sec > 0:
+            c.extend(["-t", f"{duration_sec:.3f}"])
+
+        c.extend(["-avoid_negative_ts", "make_zero", "-shortest", output_path])
+        return c
 
     print("\n" + "=" * 65)
     print(f"🎬 Source Video  : {video_path}")
@@ -587,10 +663,9 @@ def run_pipeline(
     print(f"📁 Output File   : {output_path}")
     print("=" * 65 + "\n")
 
-    start_time = time.time()
-    try:
+    def _execute_ffmpeg_proc(run_cmd: list) -> Tuple[int, str]:
         proc = subprocess.Popen(
-            cmd,
+            run_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=True
@@ -603,6 +678,7 @@ def run_pipeline(
 
         last_report = time.time()
         error_lines = []
+        printed_errors = 0
         for line in iter(proc.stdout.readline, ""):
             if cancel_check and cancel_check():
                 proc.kill()
@@ -616,17 +692,40 @@ def run_pipeline(
                     print(f"\r🚀 Progress: {line_s}", end="", flush=True)
                     last_report = now
             elif any(k in line_s.lower() for k in ["error", "invalid", "failed", "unable"]):
-                print(f"\n{line_s}")
+                if printed_errors < 15:
+                    print(f"\n{line_s}")
+                    printed_errors += 1
+                elif printed_errors == 15:
+                    print("\n[Additional error lines throttled to prevent terminal flood...]")
+                    printed_errors += 1
                 error_lines.append(line_s)
+                if len(error_lines) > 50:
+                    error_lines.pop(0)
 
         proc.stdout.close()
-        return_code = proc.wait()
-
+        rc = proc.wait()
         if cancel_check and cancel_check():
             raise RuntimeError("Operation stopped by user (Master Kill).")
+        err_out = "\n".join(error_lines[-5:]) if error_lines else f"FFmpeg exited with error code {rc}"
+        return rc, err_out
+
+    start_time = time.time()
+    try:
+        primary_cmd = _build_ffmpeg_cmd(seek_mode="fast")
+        return_code, err_msg = _execute_ffmpeg_proc(primary_cmd)
+
+        # If fast seek failed (common on non-keyframes / AAC offset streams), retry with safe sequential decoding
+        if return_code != 0 and start_sec is not None and start_sec > 0 and not (cancel_check and cancel_check()):
+            print(f"\n⚠️ Fast seek failed (exit code {return_code}). Retrying with safe sequential decoding...")
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+            fallback_cmd = _build_ffmpeg_cmd(seek_mode="safe")
+            return_code, err_msg = _execute_ffmpeg_proc(fallback_cmd)
 
         if return_code != 0:
-            err_msg = "\n".join(error_lines[-5:]) if error_lines else f"FFmpeg exited with error code {return_code}"
             print(f"\n❌ FFmpeg exited with error code {return_code}: {err_msg}", file=sys.stderr)
             raise RuntimeError(f"FFmpeg render failed (exit code {return_code}): {err_msg}")
 
@@ -670,6 +769,8 @@ def concat_video_segments(
         # Attempt 1: Fast stream copy via concat demuxer
         cmd = [
             "ffmpeg", "-y",
+            "-err_detect", "ignore_err",
+            "-max_error_rate", "1.0",
             "-f", "concat",
             "-safe", "0",
             "-i", str(list_path),
@@ -684,7 +785,12 @@ def concat_video_segments(
         encoders = get_available_encoders()
         hw_enabled = use_hw_accel and encoders.get("videotoolbox", False)
 
-        fallback_cmd = ["ffmpeg", "-y"]
+        fallback_cmd = [
+            "ffmpeg", "-y",
+            "-err_detect", "ignore_err",
+            "-max_error_rate", "1.0",
+            "-fflags", "+genpts+discardcorrupt"
+        ]
         for p in segment_paths:
             fallback_cmd.extend(["-i", p])
 
@@ -729,6 +835,7 @@ def generate_3segment_preview(
     font_size: int = 22,
     font_color: str = "&H00FFFFFF",
     caption_style: Optional[str] = None,
+    caption_border: Optional[str] = None,
     bitrate: str = "5000k",
     bottom_fade: bool = False,
     fade_height: float = 0.38,
@@ -796,6 +903,7 @@ def generate_3segment_preview(
                 font_size=font_size,
                 font_color=font_color,
                 caption_style=caption_style,
+                caption_border=caption_border,
                 bitrate=bitrate,
                 bottom_fade=bottom_fade,
                 fade_height=fade_height,
@@ -857,6 +965,7 @@ def main():
     parser.add_argument("--font-size", type=int, default=22, help="Font size for subtitles")
     parser.add_argument("--font-color", default="&H00FFFFFF", help="Font color for subtitles (&H00FFFFFF for white, &H0000FFFF for yellow)")
     parser.add_argument("--caption-style", default="✨ Soothe White Light (Soft Clean Glow)", help="Preset caption style (e.g. 'Soothe White Light', 'Viral Reel Yellow', 'Frosted Pill Box')")
+    parser.add_argument("--caption-border", default="Auto (Preset Default)", help="Caption border style (No Border, Small Border, Standard Border, Bold Border, Heavy Outline, Opaque Box, Auto)")
     parser.add_argument("--multi-preview", action="store_true", help="Generate a 3-segment combined test preview (0%%, 45%%, 75%% of video length, 1 min each combined into 1 video)")
     parser.add_argument("--preview-seg-dur", type=float, default=60.0, help="Duration of each segment in multi-preview in seconds (default: 60.0s / 1 min)")
     parser.add_argument("--bitrate", default="6000k", help="Video bitrate for VideoToolbox encoding (default 6000k)")
@@ -897,6 +1006,7 @@ def main():
             font_size=args.font_size,
             font_color=args.font_color,
             caption_style=args.caption_style,
+            caption_border=args.caption_border,
             bitrate=args.bitrate,
             bottom_fade=args.bottom_fade,
             fade_height=args.fade_height,
@@ -918,6 +1028,7 @@ def main():
             font_size=args.font_size,
             font_color=args.font_color,
             caption_style=args.caption_style,
+            caption_border=args.caption_border,
             bitrate=args.bitrate,
             bottom_fade=args.bottom_fade,
             fade_height=args.fade_height,

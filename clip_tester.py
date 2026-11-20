@@ -225,7 +225,32 @@ def get_video_streams_info(video_path: str) -> Dict[str, Any]:
         raise RuntimeError(f"ffprobe failed for '{video_path}': {res.stderr}")
     data = json.loads(res.stdout)
     has_audio = any(s.get("codec_type") == "audio" for s in data.get("streams", []))
-    duration = float(data.get("format", {}).get("duration", 0.0))
+    v_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
+
+    v_dur = 0.0
+    if v_stream:
+        try:
+            raw_vd = v_stream.get("duration")
+            if raw_vd not in [None, "N/A", ""]:
+                v_dur = float(raw_vd)
+        except (ValueError, TypeError):
+            pass
+
+    fmt_dur = 0.0
+    try:
+        raw_fd = data.get("format", {}).get("duration")
+        if raw_fd not in [None, "N/A", ""]:
+            fmt_dur = float(raw_fd)
+    except (ValueError, TypeError):
+        pass
+
+    if v_dur > 0 and fmt_dur > 0:
+        duration = min(v_dur, fmt_dur)
+    elif v_dur > 0:
+        duration = v_dur
+    else:
+        duration = fmt_dur
+
     return {"has_audio": has_audio, "duration": duration}
 
 
@@ -323,19 +348,26 @@ def render_clip(
     audio_map = "0:a"
     if has_music and has_vid_audio:
         # Scale background music, mix with video audio (speech stays at 100% via normalize=0)
+        filter_chains.append("[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a0_clean]")
         filter_chains.append(f"[1:a]volume={music_volume:.3f}[bg_ducked]")
-        filter_chains.append(f"[0:a][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]")
+        filter_chains.append("[a0_clean][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]")
         audio_map = "[a_out]"
     elif has_music and not has_vid_audio:
         # No audio in video, only background music
         filter_chains.append(f"[1:a]volume={music_volume:.3f}[a_out]")
         audio_map = "[a_out]"
     elif not has_music and has_vid_audio:
-        audio_map = "0:a"
+        filter_chains.append("[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a_out]")
+        audio_map = "[a_out]"
     else:
         audio_map = None
 
-    cmd = ["ffmpeg", "-y"] + inputs
+    cmd = [
+        "ffmpeg", "-y",
+        "-err_detect", "ignore_err",
+        "-max_error_rate", "1.0",
+        "-fflags", "+genpts+discardcorrupt"
+    ] + inputs
 
     if filter_chains:
         cmd.extend(["-filter_complex", ";".join(filter_chains)])
@@ -354,7 +386,7 @@ def render_clip(
     if audio_map:
         cmd.extend(["-c:a", "aac", "-b:a", "192k"])
 
-    cmd.extend(["-shortest", output_path])
+    cmd.extend(["-avoid_negative_ts", "make_zero", "-shortest", output_path])
 
     logger.info(f"Rendering clip ({duration_sec:.1f}s)...")
     res = subprocess.run(cmd, capture_output=True, text=True)
@@ -377,6 +409,8 @@ def extract_thumbnail(
 
     cmd = [
         "ffmpeg", "-y",
+        "-err_detect", "ignore_err",
+        "-max_error_rate", "1.0",
         "-ss", f"{target_sec:.3f}",
         "-i", clip_path,
         "-vframes", "1",
