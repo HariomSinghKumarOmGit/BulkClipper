@@ -22,6 +22,10 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
+for extra_path in ["/opt/homebrew/bin", "/usr/local/bin"]:
+    if extra_path not in os.environ.get("PATH", "") and os.path.exists(extra_path):
+        os.environ["PATH"] = extra_path + ":" + os.environ.get("PATH", "")
+
 from sub_utils import prepare_shifted_subtitles, load_any_subtitles
 
 
@@ -85,6 +89,102 @@ def probe_video(video_path: str) -> Dict[str, Any]:
         "video_duration": v_dur,
         "format_duration": fmt_dur
     }
+
+
+def probe_audio(audio_path: str) -> Dict[str, Any]:
+    """Probes audio file for stream info, duration, and codec using ffprobe."""
+    check_dependencies()
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_format", "-show_streams",
+        audio_path
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Failed to probe audio '{audio_path}': {res.stderr}")
+    data = json.loads(res.stdout)
+    a_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
+    dur = 0.0
+    try:
+        raw_dur = data.get("format", {}).get("duration")
+        if raw_dur not in [None, "N/A", ""]:
+            dur = float(raw_dur)
+    except (ValueError, TypeError):
+        pass
+    codec = a_stream.get("codec_name", "audio") if a_stream else "audio"
+    sample_rate = a_stream.get("sample_rate", 44100) if a_stream else 44100
+    return {
+        "duration": dur,
+        "codec": codec,
+        "sample_rate": sample_rate,
+        "has_audio": bool(a_stream)
+    }
+
+
+def combine_video_audio(
+    video_path: str,
+    audio_path: str,
+    output_path: str,
+    cancel_check: Optional[Any] = None,
+    proc_callback: Optional[Any] = None
+) -> Tuple[bool, str]:
+    """
+    Combines an external high-quality audio file with a video into a single MP4.
+    Copies video stream directly without loss or re-encoding (-c:v copy),
+    encodes audio in high-fidelity AAC 320k (-c:a aac -b:a 320k).
+    """
+    check_dependencies()
+    v_info = probe_video(video_path)
+    total_dur = v_info.get("duration", 0.0)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-err_detect", "ignore_err",
+        "-max_error_rate", "1.0",
+        "-fflags", "+genpts+discardcorrupt",
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "320k"
+    ]
+    if total_dur > 0:
+        cmd.extend(["-t", f"{total_dur:.3f}"])
+    cmd.extend(["-shortest", "-avoid_negative_ts", "make_zero", output_path])
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True
+    )
+    if proc_callback:
+        try:
+            proc_callback(proc)
+        except Exception:
+            pass
+
+    error_lines = []
+    for line in iter(proc.stdout.readline, ""):
+        if cancel_check and cancel_check():
+            proc.kill()
+            proc.wait()
+            raise RuntimeError("Operation cancelled by user.")
+        line_s = line.strip()
+        if any(k in line_s.lower() for k in ["error", "invalid", "failed", "unable"]):
+            error_lines.append(line_s)
+            if len(error_lines) > 20:
+                error_lines.pop(0)
+
+    proc.stdout.close()
+    rc = proc.wait()
+    if rc != 0:
+        err_out = "\n".join(error_lines[-5:]) if error_lines else f"FFmpeg exited with error code {rc}"
+        return False, err_out
+    return True, output_path
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -487,7 +587,8 @@ def run_pipeline(
     fade_opacity: float = 0.92,
     sub_margin_v: Optional[int] = None,
     cancel_check: Optional[Any] = None,
-    proc_callback: Optional[Any] = None
+    proc_callback: Optional[Any] = None,
+    audio_path: Optional[str] = None
 ) -> None:
     """Runs the FFmpeg pipeline with optional duration / start for preview or full render."""
     check_dependencies()
@@ -503,9 +604,10 @@ def run_pipeline(
         if duration_sec > rem_sec:
             duration_sec = rem_sec
 
+    has_ext_audio = bool(audio_path and os.path.exists(audio_path))
     has_vid_audio = v_info["has_audio"]
-    has_music = music_path and os.path.exists(music_path) and music_volume > 0
-    has_srt = srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 0
+    has_music = bool(music_path and os.path.exists(music_path) and music_volume > 0)
+    has_srt = bool(srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 0)
 
     encoders = get_available_encoders()
     hw_enabled = use_hw_accel and encoders.get("videotoolbox", False)
@@ -588,17 +690,25 @@ def run_pipeline(
     else:
         video_map = "0:v"
 
-    # 3. Audio Filters (Mix main voice + ducked background music with robust timestamp resample)
-    if has_music and has_vid_audio:
+    # 3. Audio Filters (Mix main voice/audio + ducked background music with robust timestamp resample)
+    if has_ext_audio:
+        filter_complex_parts.append("[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a_main_clean]")
+        if has_music:
+            filter_complex_parts.append(f"[2:a]volume={music_volume:.3f}[bg_ducked]")
+            filter_complex_parts.append("[a_main_clean][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]")
+            audio_map = "[a_out]"
+        else:
+            audio_map = "[a_main_clean]"
+    elif has_vid_audio:
         filter_complex_parts.append("[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a0_clean]")
-        filter_complex_parts.append(f"[1:a]volume={music_volume:.3f}[bg_ducked]")
-        filter_complex_parts.append("[a0_clean][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]")
-        audio_map = "[a_out]"
-    elif has_music and not has_vid_audio:
+        if has_music:
+            filter_complex_parts.append(f"[1:a]volume={music_volume:.3f}[bg_ducked]")
+            filter_complex_parts.append("[a0_clean][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]")
+            audio_map = "[a_out]"
+        else:
+            audio_map = "[a0_clean]"
+    elif has_music:
         filter_complex_parts.append(f"[1:a]volume={music_volume:.3f}[a_out]")
-        audio_map = "[a_out]"
-    elif not has_music and has_vid_audio:
-        filter_complex_parts.append("[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a_out]")
         audio_map = "[a_out]"
     else:
         audio_map = None
@@ -613,6 +723,11 @@ def run_pipeline(
         if seek_mode == "fast" and start_sec is not None and start_sec > 0:
             c.extend(["-ss", f"{start_sec:.3f}"])
         c.extend(["-i", video_path])
+
+        if has_ext_audio:
+            if seek_mode == "fast" and start_sec is not None and start_sec > 0:
+                c.extend(["-ss", f"{start_sec:.3f}"])
+            c.extend(["-i", audio_path])
 
         if has_music:
             c.extend(["-stream_loop", "-1", "-i", music_path])
@@ -654,6 +769,8 @@ def run_pipeline(
     print(f"🎬 Source Video  : {video_path}")
     print(f"📐 Resolution    : {v_info['width']}x{v_info['height']}")
     print(f"⏱️  Duration      : {duration_sec if duration_sec else total_dur:.1f}s")
+    if has_ext_audio:
+        print(f"🎵 Main Audio    : {audio_path}")
     if crop_filter:
         print(f"✂️  Crop Filter   : {crop_filter}")
     if has_srt:
@@ -843,7 +960,8 @@ def generate_3segment_preview(
     sub_margin_v: Optional[int] = None,
     cancel_check: Optional[Any] = None,
     proc_callback: Optional[Any] = None,
-    status_callback: Optional[Any] = None
+    status_callback: Optional[Any] = None,
+    audio_path: Optional[str] = None
 ) -> str:
     """
     Generates a 3-segment combined test preview video:
@@ -910,7 +1028,8 @@ def generate_3segment_preview(
                 fade_opacity=fade_opacity,
                 sub_margin_v=sub_margin_v,
                 cancel_check=cancel_check,
-                proc_callback=proc_callback
+                proc_callback=proc_callback,
+                audio_path=audio_path
             )
 
         if cancel_check and cancel_check():
@@ -956,6 +1075,7 @@ def main():
     parser.add_argument("--fade-height", type=float, default=0.38, help="Fraction of frame height for bottom black fade (default: 0.38)")
     parser.add_argument("--fade-opacity", type=float, default=0.92, help="Maximum opacity of bottom black fade (default: 0.92)")
     parser.add_argument("-s", "--srt", "--sub", dest="srt", help="Path to subtitle or lyrics file (.srt, .ass, .lrc, .vtt)")
+    parser.add_argument("-a", "--audio", help="Path to high-quality / separate main audio file (.m4a, .mp3, .wav, .aac, .opus) to replace or supply video audio")
     parser.add_argument("-m", "--music", help="Path to background music file")
     parser.add_argument("--volume", type=float, default=0.12, help="Background music volume multiplier (default: 0.12)")
     parser.add_argument("--start", type=float, default=None, help="Start time offset in seconds")
@@ -1011,7 +1131,8 @@ def main():
             bottom_fade=args.bottom_fade,
             fade_height=args.fade_height,
             fade_opacity=args.fade_opacity,
-            sub_margin_v=args.sub_margin
+            sub_margin_v=args.sub_margin,
+            audio_path=args.audio
         )
     else:
         run_pipeline(
@@ -1033,7 +1154,8 @@ def main():
             bottom_fade=args.bottom_fade,
             fade_height=args.fade_height,
             fade_opacity=args.fade_opacity,
-            sub_margin_v=args.sub_margin
+            sub_margin_v=args.sub_margin,
+            audio_path=args.audio
         )
 
 

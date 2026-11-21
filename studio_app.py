@@ -17,9 +17,14 @@ import sys
 import time
 import json
 import shutil
+import queue
 import threading
 import subprocess
 from pathlib import Path
+
+for extra_path in ["/opt/homebrew/bin", "/usr/local/bin"]:
+    if extra_path not in os.environ.get("PATH", "") and os.path.exists(extra_path):
+        os.environ["PATH"] = extra_path + ":" + os.environ.get("PATH", "")
 from typing import Optional, Dict, Any, Tuple
 from tkinter import filedialog, messagebox
 
@@ -29,12 +34,13 @@ from PIL import Image, ImageDraw, ImageFont
 
 # Import core multimedia processor & utilities
 from process_full import (
-    probe_video, compute_crop_filter, run_pipeline, get_available_encoders,
-    generate_3segment_preview, CAPTION_STYLES
+    probe_video, probe_audio, compute_crop_filter, run_pipeline, get_available_encoders,
+    generate_3segment_preview, combine_video_audio, CAPTION_STYLES
 )
 from sub_utils import parse_timestamp_entries, sanitize_filename, auto_fix_timestamp_text
 from clip_tester import extract_thumbnail
 from config_manager import load_saved_config, save_saved_config
+from yt_downloader import YouTubeDownloader, DOWNLOADS_DIR
 
 # Set appearance and theme
 ctk.set_appearance_mode("Dark")
@@ -123,11 +129,17 @@ class StudioClipperApp(ctk.CTk):
 
         # State variables
         self.video_path: Optional[str] = None
+        self.audio_path: Optional[str] = None
         self.srt_path: Optional[str] = None
         self.music_path: Optional[str] = None
         self.video_info: Dict[str, Any] = {}
         self.base_frame_image: Optional[Image.Image] = None
         self.raw_frame_path = str(BASE_DIR / ".temp_raw_frame.jpg")
+
+        # YouTube Downloader state
+        self.yt_downloader: Optional[YouTubeDownloader] = None
+        self.is_yt_downloading: bool = False
+        self.yt_msg_queue: queue.Queue = queue.Queue()
 
         # Load Persistent Configuration
         saved_cfg = load_saved_config()
@@ -146,6 +158,11 @@ class StudioClipperApp(ctk.CTk):
         self.bottom_fade_var = ctk.BooleanVar(value=active_cfg["bottom_fade"])
         self.fade_height = active_cfg.get("fade_height", 0.38)
         self.fade_opacity = active_cfg.get("fade_opacity", 0.92)
+
+        # Audio track pairing configuration (Sections 1: High-Quality Audio Pairing)
+        audio_cfg = saved_cfg.get("audio", {})
+        self.saved_audio_enabled = audio_cfg.get("enabled", True)
+        self.saved_audio_path = audio_cfg.get("path", "")
 
         # Universal Sections 3 (Subtitles) & 4 (Music & Volume)
         sub_cfg = saved_cfg.get("subtitles", {})
@@ -184,7 +201,13 @@ class StudioClipperApp(ctk.CTk):
             if default_video.exists():
                 self._load_video(str(default_video))
 
-        # Restore universal subtitle & music paths if valid
+        # Restore paired audio, universal subtitle & music paths if valid
+        if hasattr(self, "saved_audio_path") and self.saved_audio_path and os.path.exists(self.saved_audio_path):
+            self.audio_path = self.saved_audio_path
+            self.audio_entry.delete(0, "end")
+            self.audio_entry.insert(0, self.saved_audio_path)
+            self._update_audio_info(self.saved_audio_path)
+
         if hasattr(self, "saved_srt_path") and self.saved_srt_path and os.path.exists(self.saved_srt_path):
             self.srt_path = self.saved_srt_path
             self.srt_entry.delete(0, "end")
@@ -279,8 +302,117 @@ class StudioClipperApp(ctk.CTk):
         self.btn_1click_folder.pack(side="right", padx=(0, 8), pady=4)
         self.btn_auto_badge = self.btn_1click_folder
 
-        # 1. Source Video Selection
-        self._create_section_label(self.left_frame, "1. Source Video (.mp4, .mov, .mkv)")
+        # 1. Source Video Selection (YouTube Link or Local Video File)
+        self._create_section_label(self.left_frame, "1. Source Video (YouTube Download or Local File)")
+
+        # --- A. YouTube Video Downloader Card ---
+        yt_card = ctk.CTkFrame(self.left_frame, fg_color="#181c27", corner_radius=10, border_width=1, border_color="#2c3344")
+        yt_card.pack(fill="x", pady=(0, 10), padx=2)
+
+        yt_header_box = ctk.CTkFrame(yt_card, fg_color="transparent")
+        yt_header_box.pack(fill="x", padx=10, pady=(8, 4))
+
+        yt_icon_title = ctk.CTkLabel(
+            yt_header_box,
+            text="🔴 Paste YouTube Link (Highest Quality Video+Audio Merged)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#f8fafc"
+        )
+        yt_icon_title.pack(side="left")
+
+        self.btn_open_downloads = ctk.CTkButton(
+            yt_header_box,
+            text="📂 Downloads",
+            width=95,
+            height=22,
+            font=ctk.CTkFont(size=11),
+            fg_color="#1e293b",
+            hover_color="#334155",
+            command=self._open_downloads_folder
+        )
+        self.btn_open_downloads.pack(side="right")
+
+        yt_input_box = ctk.CTkFrame(yt_card, fg_color="transparent")
+        yt_input_box.pack(fill="x", padx=10, pady=(0, 8))
+
+        self.yt_url_entry = ctk.CTkEntry(
+            yt_input_box,
+            placeholder_text="Paste YouTube video or Shorts link here (e.g. https://youtu.be/...)..."
+        )
+        self.yt_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.yt_url_entry.bind("<Return>", lambda e: self._start_yt_download())
+
+        self.btn_yt_paste = ctk.CTkButton(
+            yt_input_box,
+            text="📋 Paste",
+            width=65,
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self._paste_yt_url
+        )
+        self.btn_yt_paste.pack(side="left", padx=(0, 6))
+
+        self.btn_yt_download = ctk.CTkButton(
+            yt_input_box,
+            text="⬇️ Download",
+            width=100,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#dc2626",
+            hover_color="#b91c1c",
+            command=self._start_yt_download
+        )
+        self.btn_yt_download.pack(side="right")
+
+        # Progress / Status frame
+        self.yt_progress_frame = ctk.CTkFrame(yt_card, fg_color="#111520", corner_radius=6)
+        self.yt_progress_frame.pack(fill="x", padx=10, pady=(0, 8))
+
+        self.yt_title_label = ctk.CTkLabel(
+            self.yt_progress_frame,
+            text="",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#e2e8f0",
+            anchor="w"
+        )
+        self.yt_title_label.pack(fill="x", padx=8, pady=(4, 2))
+
+        self.yt_progress_bar = ctk.CTkProgressBar(self.yt_progress_frame, height=8, corner_radius=4)
+        self.yt_progress_bar.set(0.0)
+        self.yt_progress_bar.pack(fill="x", padx=8, pady=(2, 4))
+
+        yt_status_row = ctk.CTkFrame(self.yt_progress_frame, fg_color="transparent")
+        yt_status_row.pack(fill="x", padx=8, pady=(0, 4))
+
+        self.yt_status_label = ctk.CTkLabel(
+            yt_status_row,
+            text="Ready to download high-res video (auto-loads into Clipper upon finish)",
+            font=ctk.CTkFont(size=11),
+            text_color="#94a3b8",
+            anchor="w"
+        )
+        self.yt_status_label.pack(side="left", fill="x", expand=True)
+
+        self.btn_yt_cancel = ctk.CTkButton(
+            yt_status_row,
+            text="✕ Cancel",
+            width=65,
+            height=20,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#475569",
+            hover_color="#64748b",
+            state="disabled",
+            command=self._cancel_yt_download
+        )
+        self.btn_yt_cancel.pack(side="right")
+
+        # --- B. Local Video Selection ---
+        local_label = ctk.CTkLabel(
+            self.left_frame,
+            text="📁 Or Select Local Video File (.mp4, .mov, .mkv):",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#94a3b8"
+        )
+        local_label.pack(anchor="w", pady=(0, 4))
         
         vid_box = ctk.CTkFrame(self.left_frame, fg_color="transparent")
         vid_box.pack(fill="x", pady=(0, 6))
@@ -297,7 +429,64 @@ class StudioClipperApp(ctk.CTk):
             text_color="gray",
             font=ctk.CTkFont(size=12)
         )
-        self.meta_label.pack(anchor="w", pady=(0, 14))
+        self.meta_label.pack(anchor="w", pady=(0, 6))
+
+        # Audio Pairing controls (for videos downloaded without high-quality audio)
+        audio_sub_frame = ctk.CTkFrame(self.left_frame, fg_color="#181c27", corner_radius=8)
+        audio_sub_frame.pack(fill="x", pady=(0, 14), padx=2)
+
+        audio_header_box = ctk.CTkFrame(audio_sub_frame, fg_color="transparent")
+        audio_header_box.pack(fill="x", padx=10, pady=(8, 4))
+
+        self.audio_switch_var = ctk.BooleanVar(value=self.saved_audio_enabled)
+        self.audio_switch = ctk.CTkSwitch(
+            audio_header_box,
+            text="🎵 Combine High-Quality Audio (.m4a, .mp3, .wav)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            variable=self.audio_switch_var,
+            command=self._on_audio_switch_changed
+        )
+        self.audio_switch.pack(side="left")
+
+        audio_box = ctk.CTkFrame(audio_sub_frame, fg_color="transparent")
+        audio_box.pack(fill="x", padx=10, pady=(0, 6))
+
+        self.audio_entry = ctk.CTkEntry(
+            audio_box,
+            placeholder_text="Select audio track to replace/add to video..."
+        )
+        self.audio_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        self.btn_browse_audio = ctk.CTkButton(
+            audio_box,
+            text="🎵 Choose Audio",
+            width=110,
+            command=self._browse_audio
+        )
+        self.btn_browse_audio.pack(side="right")
+
+        audio_action_box = ctk.CTkFrame(audio_sub_frame, fg_color="transparent")
+        audio_action_box.pack(fill="x", padx=10, pady=(0, 8))
+
+        self.audio_meta_label = ctk.CTkLabel(
+            audio_action_box,
+            text="No audio file selected (video audio will be used)",
+            text_color="#94a3b8",
+            font=ctk.CTkFont(size=11)
+        )
+        self.audio_meta_label.pack(side="left", anchor="w")
+
+        self.btn_quick_combine = ctk.CTkButton(
+            audio_action_box,
+            text="⚡ Combine Now",
+            width=110,
+            height=26,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#3b82f6",
+            hover_color="#2563eb",
+            command=self._quick_combine_audio_video
+        )
+        self.btn_quick_combine.pack(side="right")
 
         # 2. Aspect Ratio & Crop Positioning
         self.section_2_label = self._create_section_label(self.left_frame, "2. Aspect Ratio & Crop Framing (📱 Shorts)")
@@ -1167,6 +1356,145 @@ class StudioClipperApp(ctk.CTk):
         return lbl
 
     # ==============================================================
+    # YOUTUBE HIGHEST QUALITY DOWNLOADER
+    # ==============================================================
+    def _paste_yt_url(self):
+        try:
+            clip_text = self.clipboard_get().strip()
+            if clip_text:
+                self.yt_url_entry.delete(0, "end")
+                self.yt_url_entry.insert(0, clip_text)
+        except Exception:
+            pass
+
+    def _open_downloads_folder(self):
+        DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(["open", str(DOWNLOADS_DIR)])
+        except Exception as e:
+            messagebox.showerror("Error Opening Folder", str(e))
+
+    def _start_yt_download(self):
+        url = self.yt_url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Missing Link", "Please paste or enter a YouTube video or Shorts link.")
+            return
+        if not (url.startswith("http://") or url.startswith("https://")):
+            messagebox.showwarning("Invalid Link", "Please enter a valid link starting with https://")
+            return
+        if self.is_yt_downloading:
+            messagebox.showinfo("Download in Progress", "A YouTube download is already in progress. Please wait or click Cancel.")
+            return
+
+        self.is_yt_downloading = True
+        self.btn_yt_download.configure(state="disabled", text="⏳ Starting...")
+        self.btn_yt_cancel.configure(state="normal")
+        self.yt_progress_bar.set(0.0)
+        self.yt_title_label.configure(text="🔍 Fetching highest quality video & audio streams...")
+        self.yt_status_label.configure(text="Connecting to YouTube...", text_color="#38bdf8")
+
+        # Clear any leftover messages from queue
+        while not self.yt_msg_queue.empty():
+            try:
+                self.yt_msg_queue.get_nowait()
+            except Exception:
+                break
+
+        self.yt_downloader = YouTubeDownloader(
+            output_dir=DOWNLOADS_DIR,
+            progress_callback=lambda d: self.yt_msg_queue.put(("progress", d)),
+            completion_callback=lambda f: self.yt_msg_queue.put(("complete", f)),
+            error_callback=lambda e: self.yt_msg_queue.put(("error", e)),
+        )
+        self.yt_downloader.start_download_async(url)
+        self.after(50, self._check_yt_queue)
+
+    def _check_yt_queue(self):
+        try:
+            while not self.yt_msg_queue.empty():
+                msg_type, payload = self.yt_msg_queue.get_nowait()
+                if msg_type == "progress":
+                    self._on_yt_progress(payload)
+                elif msg_type == "complete":
+                    self._on_yt_complete(payload)
+                elif msg_type == "error":
+                    self._on_yt_error(payload)
+        except Exception:
+            pass
+
+        if self.is_yt_downloading or not self.yt_msg_queue.empty():
+            self.after(50, self._check_yt_queue)
+
+    def _on_yt_progress(self, data: Dict[str, Any]):
+        status = data.get("status")
+        title = data.get("title", "")
+        if title:
+            clean_title = title if len(title) <= 55 else title[:55] + "..."
+            self.yt_title_label.configure(text=f"🎬 {clean_title}")
+
+        pct = data.get("percent", 0.0)
+        self.yt_progress_bar.set(pct / 100.0)
+
+        if status == "downloading":
+            self.btn_yt_download.configure(state="disabled", text=f"⏳ {pct:.0f}%")
+            stream = data.get("stream", "Stream")
+            speed = data.get("speed", "")
+            eta = data.get("eta", "")
+            size = data.get("size", "")
+            stat_text = f"⬇️ {stream}: {pct:.1f}%"
+            details = []
+            if size:
+                details.append(size)
+            if speed:
+                details.append(speed)
+            if eta and eta != "--:--":
+                details.append(f"ETA {eta}")
+            if details:
+                stat_text += f" ({', '.join(details)})"
+            self.yt_status_label.configure(text=stat_text, text_color="#38bdf8")
+        elif status in ["processing", "merging"]:
+            self.btn_yt_download.configure(state="disabled", text="⚡ Merging...")
+            self.yt_status_label.configure(
+                text=data.get("message", "⚡ Merging highest quality Video & Audio with FFmpeg locally..."),
+                text_color="#f59e0b"
+            )
+        elif status in ["starting", "fetching_info"]:
+            self.yt_status_label.configure(text=data.get("message", "Fetching info..."), text_color="#94a3b8")
+        elif status == "cancelled":
+            self.yt_status_label.configure(text="Download cancelled", text_color="#ef4444")
+
+    def _on_yt_complete(self, filepath: str):
+        self.is_yt_downloading = False
+        self.btn_yt_download.configure(state="normal", text="⬇️ Download")
+        self.btn_yt_cancel.configure(state="disabled")
+        self.yt_progress_bar.set(1.0)
+        filename = Path(filepath).name
+        self.yt_title_label.configure(text=f"🎬 {filename}")
+        self.yt_status_label.configure(
+            text=f"✅ Downloaded & Loaded into Clipper! (Highest Quality Merged)",
+            text_color="#4ade80"
+        )
+        # Automatically load into Clipper
+        if os.path.exists(filepath):
+            self._load_video(filepath)
+
+    def _on_yt_error(self, err_msg: str):
+        self.is_yt_downloading = False
+        self.btn_yt_download.configure(state="normal", text="⬇️ Download")
+        self.btn_yt_cancel.configure(state="disabled")
+        self.yt_status_label.configure(text=f"❌ Failed: {err_msg[:75]}", text_color="#f87171")
+        messagebox.showerror("YouTube Download Error", f"Failed to download video:\n\n{err_msg}")
+
+    def _cancel_yt_download(self):
+        if self.yt_downloader and self.is_yt_downloading:
+            self.yt_downloader.cancel()
+        self.is_yt_downloading = False
+        self.btn_yt_download.configure(state="normal", text="⬇️ Download")
+        self.btn_yt_cancel.configure(state="disabled")
+        self.yt_progress_bar.set(0.0)
+        self.yt_status_label.configure(text="Download cancelled by user", text_color="#94a3b8")
+
+    # ==============================================================
     # FILE BROWSING & DATA LOADING
     # ==============================================================
     def _browse_video(self):
@@ -1190,7 +1518,14 @@ class StudioClipperApp(ctk.CTk):
             w = self.video_info["width"]
             h = self.video_info["height"]
             dur = self.video_info["duration"]
-            audio = "Yes" if self.video_info["has_audio"] else "No"
+            has_hq_audio = (
+                hasattr(self, "audio_switch_var") and
+                self.audio_switch_var.get() and
+                hasattr(self, "audio_entry") and
+                self.audio_entry.get().strip() and
+                os.path.exists(self.audio_entry.get().strip())
+            )
+            audio = "HQ External Audio" if has_hq_audio else ("Yes" if self.video_info["has_audio"] else "No")
             
             m, s = int(dur // 60), int(dur % 60)
             dur_fmt = f"{m}m {s}s" if m < 60 else f"{m // 60}h {m % 60}m"
@@ -1202,6 +1537,137 @@ class StudioClipperApp(ctk.CTk):
             self._update_cli_display()
         except Exception as e:
             messagebox.showerror("Error Reading Video", str(e))
+
+    def _browse_audio(self):
+        path = filedialog.askopenfilename(
+            title="Choose High-Quality Audio File to Pair with Video",
+            filetypes=[
+                ("All Supported Audio Files", "*.mp3 *.m4a *.wav *.aac *.ogg *.flac *.opus *.wma *.alac"),
+                ("M4A / AAC Audio", "*.m4a *.aac"),
+                ("MP3 Audio", "*.mp3"),
+                ("WAV / Lossless", "*.wav *.flac *.alac"),
+                ("All Files", "*.*")
+            ]
+        )
+        if path:
+            self.audio_path = path
+            self.audio_entry.delete(0, "end")
+            self.audio_entry.insert(0, path)
+            self.audio_switch_var.set(True)
+            self._update_audio_info(path)
+            self._update_cli_display()
+            self._save_persistent_config()
+
+    def _on_audio_switch_changed(self):
+        self._update_audio_info(self.audio_entry.get().strip())
+        self._update_cli_display()
+        self._save_persistent_config()
+
+    def _update_audio_info(self, path: str):
+        if not path or not os.path.exists(path):
+            self.audio_meta_label.configure(
+                text="No audio file selected (video audio will be used)",
+                text_color="#94a3b8"
+            )
+            if hasattr(self, "video_info") and self.video_info:
+                w = self.video_info["width"]
+                h = self.video_info["height"]
+                dur = self.video_info["duration"]
+                m, s = int(dur // 60), int(dur % 60)
+                dur_fmt = f"{m}m {s}s" if m < 60 else f"{m // 60}h {m % 60}m"
+                audio = "Yes" if self.video_info["has_audio"] else "No"
+                self.meta_label.configure(text=f"📐 {w}x{h}  |  ⏱️ {dur_fmt}  |  🎵 Audio: {audio}")
+            return
+
+        is_enabled = self.audio_switch_var.get() if hasattr(self, "audio_switch_var") else True
+        try:
+            info = probe_audio(path)
+            dur = info.get("duration", 0.0)
+            m, s = int(dur // 60), int(dur % 60)
+            dur_fmt = f"{m}m {s}s" if m < 60 else f"{m // 60}h {m % 60}m"
+            codec = info.get("codec", "AUDIO").upper()
+            fname = Path(path).name
+            if len(fname) > 28:
+                fname = fname[:25] + "..."
+            status_prefix = "🎵 Active: " if is_enabled else "⏸️ Paused: "
+            color = "#38bdf8" if is_enabled else "#64748b"
+            self.audio_meta_label.configure(
+                text=f"{status_prefix}{fname} ({codec}, ⏱️ {dur_fmt})",
+                text_color=color
+            )
+        except Exception:
+            fname = Path(path).name
+            self.audio_meta_label.configure(
+                text=f"🎵 {fname}",
+                text_color="#38bdf8" if is_enabled else "#64748b"
+            )
+
+        if hasattr(self, "video_info") and self.video_info:
+            w = self.video_info["width"]
+            h = self.video_info["height"]
+            dur = self.video_info["duration"]
+            m, s = int(dur // 60), int(dur % 60)
+            dur_fmt = f"{m}m {s}s" if m < 60 else f"{m // 60}h {m % 60}m"
+            audio_tag = "HQ External Audio" if is_enabled else ("Yes" if self.video_info["has_audio"] else "No")
+            self.meta_label.configure(text=f"📐 {w}x{h}  |  ⏱️ {dur_fmt}  |  🎵 Audio: {audio_tag}")
+
+    def _quick_combine_audio_video(self):
+        vid = self.video_entry.get().strip() if hasattr(self, "video_entry") else ""
+        aud = self.audio_entry.get().strip() if hasattr(self, "audio_entry") else ""
+        if not vid or not os.path.exists(vid):
+            messagebox.showwarning("Missing Video", "Please select a valid source video file first.")
+            return
+        if not aud or not os.path.exists(aud):
+            messagebox.showwarning("Missing Audio", "Please select a valid high-quality audio file first.")
+            return
+
+        vid_path = Path(vid)
+        default_out = str(vid_path.parent / f"{vid_path.stem}_with_audio.mp4")
+        save_path = filedialog.asksaveasfilename(
+            title="Save Combined Video & Audio File",
+            initialdir=str(vid_path.parent),
+            initialfile=Path(default_out).name,
+            defaultextension=".mp4",
+            filetypes=[("MP4 Video (*.mp4)", "*.mp4"), ("All Files", "*.*")]
+        )
+        if not save_path:
+            return
+
+        self.status_label.configure(text="Status: ⚡ Combining Video & Audio lossless streams...")
+        self.progress_bar.set(0.3)
+        self.btn_quick_combine.configure(state="disabled", text="⏳ Combining...")
+
+        def _worker():
+            try:
+                ok, err = combine_video_audio(vid, aud, save_path)
+                if not ok:
+                    raise RuntimeError(err)
+
+                def _success():
+                    self.status_label.configure(text="Status: Ready")
+                    self.progress_bar.set(0.0)
+                    self.btn_quick_combine.configure(state="normal", text="⚡ Combine Now")
+                    ans = messagebox.askyesno(
+                        "Video & Audio Combined!",
+                        f"Video and high-quality audio combined successfully!\n\nSaved to:\n{save_path}\n\nWould you like to set this combined video as your current Source Video in Clipper?"
+                    )
+                    if ans:
+                        self._load_video(save_path)
+                        self.audio_switch_var.set(False)
+                        self._update_audio_info(self.audio_entry.get().strip())
+                        self._save_persistent_config()
+
+                self.after(0, _success)
+            except Exception as e:
+                def _fail(msg=str(e)):
+                    self.status_label.configure(text="Status: Combine error")
+                    self.progress_bar.set(0.0)
+                    self.btn_quick_combine.configure(state="normal", text="⚡ Combine Now")
+                    messagebox.showerror("Combine Error", f"Failed to combine video and audio:\n{msg}")
+
+                self.after(0, _fail)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _extract_keyframe(self, video_path: str):
         """Extracts 1 frame snapshot for the visual crop framing box."""
@@ -1286,6 +1752,8 @@ class StudioClipperApp(ctk.CTk):
             cap_border = self._get_selected_caption_border()
             cap_pos = self.caption_pos_menu.get() if hasattr(self, "caption_pos_menu") else getattr(self, "saved_caption_pos", "Caption: On Video Fade (Above Padding)")
             sub_on = self.sub_switch_var.get() if hasattr(self, "sub_switch_var") else True
+            audio_on = self.audio_switch_var.get() if hasattr(self, "audio_switch_var") else True
+            audio_entry_val = self.audio_entry.get().strip() if hasattr(self, "audio_entry") else ""
             music_on = self.music_switch_var.get() if hasattr(self, "music_switch_var") else True
             skip_on = self.skip_existing_var.get() if hasattr(self, "skip_existing_var") else True
 
@@ -1293,6 +1761,11 @@ class StudioClipperApp(ctk.CTk):
                 "active_mode": self.active_mode,
                 "shorts_config": copy.deepcopy(self.shorts_config),
                 "videos_config": copy.deepcopy(self.videos_config),
+                # Section 1: Paired High-Quality Audio
+                "audio": {
+                    "enabled": audio_on,
+                    "path": audio_entry_val or getattr(self, "audio_path", "") or "",
+                },
                 # Section 3: Universal Subtitles Configuration
                 "subtitles": {
                     "enabled": sub_on,
@@ -2224,6 +2697,10 @@ class StudioClipperApp(ctk.CTk):
             parts.append(f'-m "{music}"')
             parts.append(f'--volume {active_cfg["vol"]:.2f}')
 
+        audio = self.audio_entry.get().strip() if hasattr(self, "audio_entry") else ""
+        if hasattr(self, "audio_switch_var") and self.audio_switch_var.get() and audio and os.path.exists(audio):
+            parts.append(f'-a "{audio}"')
+
         return " ".join(parts)
 
     def _update_cli_display(self):
@@ -2291,6 +2768,9 @@ class StudioClipperApp(ctk.CTk):
             music = self.music_entry.get().strip()
             use_music = self.music_switch_var.get() and music and os.path.exists(music)
 
+            audio = self.audio_entry.get().strip() if hasattr(self, "audio_entry") else ""
+            use_audio = self.audio_switch_var.get() and audio and os.path.exists(audio) if hasattr(self, "audio_switch_var") else False
+
             cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
             font_nm = self._get_selected_font_name()
             font_sz = self._get_selected_font_size()
@@ -2314,7 +2794,8 @@ class StudioClipperApp(ctk.CTk):
                 bottom_fade=active_cfg["bottom_fade"],
                 fade_height=active_cfg.get("fade_height", self.fade_height),
                 fade_opacity=active_cfg.get("fade_opacity", self.fade_opacity),
-                sub_margin_v=sub_marg
+                sub_margin_v=sub_marg,
+                audio_path=audio if use_audio else None
             )
 
             preview_path = preview_file
@@ -2395,6 +2876,9 @@ class StudioClipperApp(ctk.CTk):
             music = self.music_entry.get().strip()
             use_music = self.music_switch_var.get() and music and os.path.exists(music)
 
+            audio = self.audio_entry.get().strip() if hasattr(self, "audio_entry") else ""
+            use_audio = self.audio_switch_var.get() and audio and os.path.exists(audio) if hasattr(self, "audio_switch_var") else False
+
             cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
             font_nm = self._get_selected_font_name()
             font_sz = self._get_selected_font_size()
@@ -2439,7 +2923,8 @@ class StudioClipperApp(ctk.CTk):
                 sub_margin_v=sub_marg,
                 cancel_check=cancel_checker,
                 proc_callback=set_proc,
-                status_callback=update_progress
+                status_callback=update_progress,
+                audio_path=audio if use_audio else None
             )
 
             preview_path = preview_file
@@ -2754,6 +3239,8 @@ class StudioClipperApp(ctk.CTk):
             use_srt = self.sub_switch_var.get() and srt and os.path.exists(srt)
             music = self.music_entry.get().strip()
             use_music = self.music_switch_var.get() and music and os.path.exists(music)
+            audio = self.audio_entry.get().strip() if hasattr(self, "audio_entry") else ""
+            use_audio = self.audio_switch_var.get() and audio and os.path.exists(audio) if hasattr(self, "audio_switch_var") else False
             cap_style = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
             font_nm = self._get_selected_font_name()
             font_sz = self._get_selected_font_size()
@@ -2834,7 +3321,8 @@ class StudioClipperApp(ctk.CTk):
                     fade_opacity=clip_fade_o,
                     sub_margin_v=sub_marg,
                     cancel_check=check_cancel,
-                    proc_callback=set_proc
+                    proc_callback=set_proc,
+                    audio_path=audio if use_audio else None
                 )
 
                 if self.is_cancelled:

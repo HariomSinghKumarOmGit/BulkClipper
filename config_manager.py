@@ -46,6 +46,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "fade_height": 0.38,
         "fade_opacity": 0.92,
     },
+    "audio": {
+        "enabled": True,
+        "path": ""
+    },
     "subtitles": {
         "enabled": True,
         "path": "",

@@ -1,45 +1,49 @@
 {
-  "active_mode": "shorts",
+  "active_mode": "videos",
   "shorts_config": {
-    "video_path": "/Users/hariomsingh/Downloads/Spiritual Karim is live 28 Apr 2025 - Spiritual Karim (720p, h264).mp4",
+    "video_path": "/Users/hariomsingh/Downloads/ Spiritual Karim is live 01 March 2026.mp4",
     "ratio_str": "9:16 (Shorts/Reels)",
     "ratio_val": "9:16",
     "scale": 1.0,
-    "pos_x": 0.25,
-    "pos_y": 0.5,
+    "pos_x": 0.5,
+    "pos_y": 0.467,
     "pad_top": 0.0,
-    "pad_bottom": 11.0,
+    "pad_bottom": 12.0,
     "bottom_fade": true,
     "fade_height": 0.54,
     "fade_opacity": 0.96,
     "vol": 0.12
   },
   "videos_config": {
-    "video_path": "/Users/hariomsingh/Downloads/Spiritual Karim is live 28 Apr 2025 - Spiritual Karim (720p, h264).mp4",
+    "video_path": "/Users/hariomsingh/Desktop/mycliper/downloaded_videos/Me at the zoo.mp4",
     "ratio_str": "9:16 (Shorts/Reels)",
     "ratio_val": "16:9",
     "scale": 1.0,
     "pos_x": 0.5,
     "pos_y": 0.5,
     "pad_top": 0.0,
-    "pad_bottom": 3.5,
+    "pad_bottom": 5.5,
     "bottom_fade": true,
-    "fade_height": 0.44,
-    "fade_opacity": 1.0,
+    "fade_height": 0.5,
+    "fade_opacity": 0.93,
     "vol": 0.12
+  },
+  "audio": {
+    "enabled": true,
+    "path": ""
   },
   "subtitles": {
     "enabled": true,
-    "path": "/Users/hariomsingh/Downloads/Spiritual Karim is live 28 Apr 2025.lrc",
+    "path": "",
     "style": "⚪ Classic Crisp White (Bold Black Border)",
     "font": "Kohinoor Devanagari",
-    "size": "18pt (Compact)",
-    "border": "Auto (Preset Default)",
+    "size": "20pt (Standard)",
+    "border": "No Border (Clean Text)",
     "position": "Caption: Inside Black Bottom Bar"
   },
   "music": {
     "enabled": true,
-    "path": "/Users/hariomsingh/Downloads/6hr+bgcalmstudy.mp3",
+    "path": "",
     "volume": 0.18
   },
   "skip_existing": true
