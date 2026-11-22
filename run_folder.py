@@ -169,7 +169,8 @@ def run_folder_system(
         pos_y=s_cfg["pos_y"],
         scale=s_cfg["scale"],
         pad_top=s_cfg["pad_top"],
-        pad_bottom=s_cfg["pad_bottom"]
+        pad_bottom=s_cfg["pad_bottom"],
+        pad_mode=s_cfg.get("pad_mode", "move_out")
     )
 
     videos_crop_filter, _, _, _, _ = compute_crop_filter(
@@ -180,17 +181,22 @@ def run_folder_system(
         pos_y=v_cfg["pos_y"],
         scale=v_cfg["scale"],
         pad_top=v_cfg["pad_top"],
-        pad_bottom=v_cfg["pad_bottom"]
+        pad_bottom=v_cfg["pad_bottom"],
+        pad_mode=v_cfg.get("pad_mode", "move_out")
     )
 
-    s_fade_h = s_cfg.get("fade_height", 0.38)
-    s_fade_o = s_cfg.get("fade_opacity", 0.92)
-    v_fade_h = v_cfg.get("fade_height", 0.38)
-    v_fade_o = v_cfg.get("fade_opacity", 0.92)
+    s_fade_h = s_cfg.get("fade_height", 0.40)
+    s_fade_o = s_cfg.get("fade_opacity", 0.95)
+    s_fade_i = s_cfg.get("fade_intensity", 1.3)
+    s_fade_y = s_cfg.get("fade_pos_y", 0.0)
+    v_fade_h = v_cfg.get("fade_height", 0.40)
+    v_fade_o = v_cfg.get("fade_opacity", 0.95)
+    v_fade_i = v_cfg.get("fade_intensity", 1.3)
+    v_fade_y = v_cfg.get("fade_pos_y", 0.0)
 
     print(f"📐 Shorts Crop (≤3m): {shorts_ratio} ({crop_w}x{crop_h}) [Scale: {s_cfg['scale']:.2f}x, Pad: T:{s_cfg['pad_top']:.1f}% B:{s_cfg['pad_bottom']:.1f}%, Vol: {int(shorts_vol*100)}%]")
     print(f"📐 Long Video (>3m) : {v_cfg['ratio_val']} [Scale: {v_cfg['scale']:.2f}x, Pad: T:{v_cfg['pad_top']:.1f}% B:{v_cfg['pad_bottom']:.1f}%, Vol: {int(videos_vol*100)}%]")
-    print(f"🖤 Bottom Black Fade: Shorts={'ON' if s_cfg['bottom_fade'] else 'OFF'} (H:{int(s_fade_h*100)}%, O:{int(s_fade_o*100)}%), Videos={'ON' if v_cfg['bottom_fade'] else 'OFF'}")
+    print(f"🖤 Bottom Black Fade: Shorts={'ON' if s_cfg['bottom_fade'] else 'OFF'} (H:{int(s_fade_h*100)}%, O:{int(s_fade_o*100)}%, I:{int(s_fade_i*100)}%, Y:{int(s_fade_y*100)}%), Videos={'ON' if v_cfg['bottom_fade'] else 'OFF'}")
     print(f"📁 Destination      : {out_dir}")
     print("=" * 65 + "\n")
 
@@ -210,6 +216,8 @@ def run_folder_system(
         clip_fade = v_cfg["bottom_fade"] if is_long else s_cfg["bottom_fade"]
         clip_fade_h = v_fade_h if is_long else s_fade_h
         clip_fade_o = v_fade_o if is_long else s_fade_o
+        clip_fade_i = v_fade_i if is_long else s_fade_i
+        clip_fade_y = v_fade_y if is_long else s_fade_y
         clip_sub_margin = 35 if "Inside Black" in caption_pos else None
 
         print(f"[{i:02d}/{total:02d}] ⚡ Clipping [{crop_tag}]: {entry['title']} ({dur:.1f}s)...")
@@ -233,6 +241,8 @@ def run_folder_system(
             bottom_fade=clip_fade,
             fade_height=clip_fade_h,
             fade_opacity=clip_fade_o,
+            fade_intensity=clip_fade_i,
+            fade_pos_y=clip_fade_y,
             sub_margin_v=clip_sub_margin,
             sub_pos_y=sub_pos_y,
             caption_overflow=caption_overflow

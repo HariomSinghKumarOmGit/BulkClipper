@@ -189,9 +189,12 @@ class StudioClipperApp(ctk.CTk):
         self.current_pos_y = active_cfg["pos_y"]
         self.current_pad_top = active_cfg["pad_top"]
         self.current_pad_bottom = active_cfg["pad_bottom"]
+        self.pad_mode = active_cfg.get("pad_mode", "move_out")
         self.bottom_fade_var = ctk.BooleanVar(value=active_cfg["bottom_fade"])
-        self.fade_height = active_cfg.get("fade_height", 0.38)
-        self.fade_opacity = active_cfg.get("fade_opacity", 0.92)
+        self.fade_height = float(active_cfg.get("fade_height", 0.40))
+        self.fade_opacity = float(active_cfg.get("fade_opacity", 0.95))
+        self.fade_intensity = float(active_cfg.get("fade_intensity", 1.3))
+        self.fade_pos_y = float(active_cfg.get("fade_pos_y", 0.0))
 
         # Audio track pairing & Main Video Volume configuration (Section 1)
         audio_cfg = saved_cfg.get("audio", {})
@@ -824,6 +827,20 @@ class StudioClipperApp(ctk.CTk):
         )
         self.btn_preset_zero.pack(side="left", padx=(4, 0), expand=True, fill="x")
 
+        # Padding Mode: Move Out of Frame (Crop / Shift) vs Zoom to Fit (Letterbox)
+        pad_mode_frame = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
+        pad_mode_frame.pack(fill="x", pady=(0, 8))
+        self.pad_mode_seg = ctk.CTkSegmentedButton(
+            pad_mode_frame,
+            values=["🎬 Move Out of Frame", "🔍 Zoom to Fit"],
+            command=self._on_pad_mode_changed,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            selected_color="#4338ca",
+            selected_hover_color="#3730a3"
+        )
+        self.pad_mode_seg.set("🎬 Move Out of Frame" if self.pad_mode == "move_out" else "🔍 Zoom to Fit")
+        self.pad_mode_seg.pack(fill="x")
+
         # Top Padding Slider with - / + buttons
         pad_top_subhead = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pad_top_subhead.pack(fill="x", pady=(0, 2))
@@ -836,7 +853,7 @@ class StudioClipperApp(ctk.CTk):
         self.btn_pad_top_minus = ctk.CTkButton(pad_top_ctrl, text="-", width=32, height=26, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
         self.btn_pad_top_minus.pack(side="left", padx=(0, 6))
 
-        self.pad_top_slider = ctk.CTkSlider(pad_top_ctrl, from_=0.0, to=30.0, number_of_steps=60, command=self._on_pad_top_slider_changed)
+        self.pad_top_slider = ctk.CTkSlider(pad_top_ctrl, from_=0.0, to=40.0, number_of_steps=80, command=self._on_pad_top_slider_changed)
         self.pad_top_slider.set(0.0)
         self.pad_top_slider.pack(side="left", fill="x", expand=True)
 
@@ -859,7 +876,7 @@ class StudioClipperApp(ctk.CTk):
         self.btn_pad_bottom_minus = ctk.CTkButton(pad_bottom_ctrl, text="-", width=32, height=26, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
         self.btn_pad_bottom_minus.pack(side="left", padx=(0, 6))
 
-        self.pad_bottom_slider = ctk.CTkSlider(pad_bottom_ctrl, from_=0.0, to=40.0, number_of_steps=80, command=self._on_pad_bottom_slider_changed)
+        self.pad_bottom_slider = ctk.CTkSlider(pad_bottom_ctrl, from_=0.0, to=50.0, number_of_steps=100, command=self._on_pad_bottom_slider_changed)
         self.pad_bottom_slider.set(0.0)
         self.pad_bottom_slider.pack(side="left", fill="x", expand=True)
 
@@ -898,7 +915,7 @@ class StudioClipperApp(ctk.CTk):
         if self.bottom_fade_var.get():
             self.fade_ctrl_frame.pack(fill="x", padx=10, pady=(0, 8))
 
-        # 1. Fade Spread / Height Slider
+        # 1. Fade Spread / Height Slider (up to 100%)
         self.fade_height_label_var = ctk.StringVar(value=f"Fade Spread: {int(round(self.fade_height * 100))}% (Coverage)")
         ctk.CTkLabel(self.fade_ctrl_frame, textvariable=self.fade_height_label_var, font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(2, 1))
 
@@ -908,7 +925,7 @@ class StudioClipperApp(ctk.CTk):
         self.btn_fh_minus = ctk.CTkButton(fh_ctrl, text="-", width=28, height=24, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
         self.btn_fh_minus.pack(side="left", padx=(0, 6))
 
-        self.fade_height_slider = ctk.CTkSlider(fh_ctrl, from_=0.15, to=0.70, number_of_steps=55, command=self._on_fade_height_slider_changed)
+        self.fade_height_slider = ctk.CTkSlider(fh_ctrl, from_=0.10, to=1.00, number_of_steps=90, command=self._on_fade_height_slider_changed)
         self.fade_height_slider.set(self.fade_height)
         self.fade_height_slider.pack(side="left", fill="x", expand=True)
 
@@ -940,12 +957,56 @@ class StudioClipperApp(ctk.CTk):
         self._attach_button_repeat(self.btn_fo_plus, self._fade_opacity_step_plus)
         self._disable_slider_scroll(self.fade_opacity_slider, self.left_frame)
 
-        # 3. Quick Presets Row
+        # 3. Fade Intensity (Deep Black Contrast Boost) Slider
+        self.fade_intensity_label_var = ctk.StringVar(value=f"Fade Intensity: {int(round(self.fade_intensity * 100))}% (Deep Contrast 🚀)")
+        ctk.CTkLabel(self.fade_ctrl_frame, textvariable=self.fade_intensity_label_var, font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(2, 1))
+
+        fi_ctrl = ctk.CTkFrame(self.fade_ctrl_frame, fg_color="transparent")
+        fi_ctrl.pack(fill="x", pady=(0, 6))
+
+        self.btn_fi_minus = ctk.CTkButton(fi_ctrl, text="-", width=28, height=24, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_fi_minus.pack(side="left", padx=(0, 6))
+
+        self.fade_intensity_slider = ctk.CTkSlider(fi_ctrl, from_=0.50, to=2.50, number_of_steps=40, command=self._on_fade_intensity_slider_changed)
+        self.fade_intensity_slider.set(self.fade_intensity)
+        self.fade_intensity_slider.pack(side="left", fill="x", expand=True)
+
+        self.btn_fi_plus = ctk.CTkButton(fi_ctrl, text="+", width=28, height=24, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_fi_plus.pack(side="right", padx=(6, 0))
+
+        self._attach_button_repeat(self.btn_fi_minus, self._fade_intensity_step_minus)
+        self._attach_button_repeat(self.btn_fi_plus, self._fade_intensity_step_plus)
+        self._disable_slider_scroll(self.fade_intensity_slider, self.left_frame)
+
+        # 4. Fade Vertical Position / Shift Slider
+        fade_y_pct = int(round(self.fade_pos_y * 100))
+        self.fade_pos_y_label_var = ctk.StringVar(value=f"Fade Vertical Shift: {fade_y_pct}% ({'Bottom' if fade_y_pct == 0 else f'Shifted Up {fade_y_pct}%'})")
+        ctk.CTkLabel(self.fade_ctrl_frame, textvariable=self.fade_pos_y_label_var, font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(2, 1))
+
+        fy_ctrl = ctk.CTkFrame(self.fade_ctrl_frame, fg_color="transparent")
+        fy_ctrl.pack(fill="x", pady=(0, 6))
+
+        self.btn_fy_minus = ctk.CTkButton(fy_ctrl, text="-", width=28, height=24, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_fy_minus.pack(side="left", padx=(0, 6))
+
+        self.fade_pos_y_slider = ctk.CTkSlider(fy_ctrl, from_=0.0, to=0.60, number_of_steps=60, command=self._on_fade_pos_y_slider_changed)
+        self.fade_pos_y_slider.set(self.fade_pos_y)
+        self.fade_pos_y_slider.pack(side="left", fill="x", expand=True)
+
+        self.btn_fy_plus = ctk.CTkButton(fy_ctrl, text="+", width=28, height=24, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
+        self.btn_fy_plus.pack(side="right", padx=(6, 0))
+
+        self._attach_button_repeat(self.btn_fy_minus, self._fade_pos_y_step_minus)
+        self._attach_button_repeat(self.btn_fy_plus, self._fade_pos_y_step_plus)
+        self._disable_slider_scroll(self.fade_pos_y_slider, self.left_frame)
+
+        # 5. Quick Presets Row
         fade_presets_row = ctk.CTkFrame(self.fade_ctrl_frame, fg_color="transparent")
         fade_presets_row.pack(fill="x", pady=(2, 4))
-        ctk.CTkButton(fade_presets_row, text="Subtle (25%)", height=24, font=ctk.CTkFont(size=10), fg_color="#2b3245", hover_color="#3b445c", command=lambda: self._set_fade_preset(0.25, 0.80)).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ctk.CTkButton(fade_presets_row, text="Standard (38%)", height=24, font=ctk.CTkFont(size=10), fg_color="#374151", hover_color="#4b5563", command=lambda: self._set_fade_preset(0.38, 0.92)).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ctk.CTkButton(fade_presets_row, text="Deep (52%)", height=24, font=ctk.CTkFont(size=10), fg_color="#2b3245", hover_color="#3b445c", command=lambda: self._set_fade_preset(0.52, 1.0)).pack(side="left", expand=True, fill="x")
+        ctk.CTkButton(fade_presets_row, text="Subtle (25%)", height=24, font=ctk.CTkFont(size=10), fg_color="#2b3245", hover_color="#3b445c", command=lambda: self._set_fade_preset(0.25, 0.85, 1.0, 0.0)).pack(side="left", expand=True, fill="x", padx=(0, 3))
+        ctk.CTkButton(fade_presets_row, text="Standard (40%)", height=24, font=ctk.CTkFont(size=10), fg_color="#374151", hover_color="#4b5563", command=lambda: self._set_fade_preset(0.40, 0.95, 1.3, 0.0)).pack(side="left", expand=True, fill="x", padx=(0, 3))
+        ctk.CTkButton(fade_presets_row, text="Deep (65%)", height=24, font=ctk.CTkFont(size=10), fg_color="#2b3245", hover_color="#3b445c", command=lambda: self._set_fade_preset(0.65, 1.0, 1.6, 0.0)).pack(side="left", expand=True, fill="x", padx=(0, 3))
+        ctk.CTkButton(fade_presets_row, text="Max Spread (85%)", height=24, font=ctk.CTkFont(size=10), fg_color="#2b3245", hover_color="#3b445c", command=lambda: self._set_fade_preset(0.85, 1.0, 2.0, 0.0)).pack(side="left", expand=True, fill="x")
 
         # 3. Subtitles & Captions / Lyrics
         self._create_section_label(self.clipper_container, "3. Subtitles & Lyrics (.srt, .ass, .lrc)")
@@ -2713,9 +2774,12 @@ class StudioClipperApp(ctk.CTk):
         cfg["pos_y"] = self.current_pos_y
         cfg["pad_top"] = self.current_pad_top
         cfg["pad_bottom"] = self.current_pad_bottom
+        cfg["pad_mode"] = getattr(self, "pad_mode", "move_out")
         cfg["bottom_fade"] = self.bottom_fade_var.get()
         cfg["fade_height"] = self.fade_height
         cfg["fade_opacity"] = self.fade_opacity
+        cfg["fade_intensity"] = getattr(self, "fade_intensity", 1.3)
+        cfg["fade_pos_y"] = getattr(self, "fade_pos_y", 0.0)
         cfg["vol"] = self.current_vol
         self.shorts_config["vol"] = self.current_vol
         self.videos_config["vol"] = self.current_vol
@@ -2860,15 +2924,28 @@ class StudioClipperApp(ctk.CTk):
         self.pad_bottom_slider.set(self.current_pad_bottom)
         self.pad_bottom_label_var.set(f"Bottom Padding: {self.current_pad_bottom:.1f}%")
 
+        self.pad_mode = cfg.get("pad_mode", "move_out")
+        if hasattr(self, "pad_mode_seg"):
+            self.pad_mode_seg.set("🎬 Move Out of Frame" if self.pad_mode == "move_out" else "🔍 Zoom to Fit")
+
         self.bottom_fade_var.set(cfg["bottom_fade"])
-        self.fade_height = cfg.get("fade_height", 0.38)
-        self.fade_opacity = cfg.get("fade_opacity", 0.92)
+        self.fade_height = cfg.get("fade_height", 0.40)
+        self.fade_opacity = cfg.get("fade_opacity", 0.95)
+        self.fade_intensity = cfg.get("fade_intensity", 1.3)
+        self.fade_pos_y = cfg.get("fade_pos_y", 0.0)
         if hasattr(self, "fade_height_slider"):
             self.fade_height_slider.set(self.fade_height)
             self.fade_height_label_var.set(f"Fade Spread: {int(round(self.fade_height * 100))}% (Coverage)")
         if hasattr(self, "fade_opacity_slider"):
             self.fade_opacity_slider.set(self.fade_opacity)
             self.fade_opacity_label_var.set(f"Fade Darkness: {int(round(self.fade_opacity * 100))}% (Contrast)")
+        if hasattr(self, "fade_intensity_slider"):
+            self.fade_intensity_slider.set(self.fade_intensity)
+            self.fade_intensity_label_var.set(f"Fade Intensity: {int(round(self.fade_intensity * 100))}% (Deep Contrast 🚀)")
+        if hasattr(self, "fade_pos_y_slider"):
+            self.fade_pos_y_slider.set(self.fade_pos_y)
+            fy_pct = int(round(self.fade_pos_y * 100))
+            self.fade_pos_y_label_var.set(f"Fade Vertical Shift: {fy_pct}% ({'Bottom' if fy_pct == 0 else f'Shifted Up {fy_pct}%'})")
         if hasattr(self, "fade_ctrl_frame"):
             if cfg["bottom_fade"]:
                 self.fade_ctrl_frame.pack(fill="x", padx=10, pady=(0, 8))
@@ -3002,13 +3079,20 @@ class StudioClipperApp(ctk.CTk):
         self._update_cli_display()
         self._update_scroll_region()
 
+    def _on_pad_mode_changed(self, mode: str):
+        self.pad_mode = "move_out" if "Move Out" in mode else "letterbox"
+        self._sync_to_active_config()
+        self._render_visual_crop()
+        self._update_cli_display()
+        self._update_scroll_region()
+
     def _pad_top_step_minus(self):
         val = max(0.0, round(self.current_pad_top - 1.0, 1))
         self.pad_top_slider.set(val)
         self._on_pad_top_slider_changed(val)
 
     def _pad_top_step_plus(self):
-        val = min(30.0, round(self.current_pad_top + 1.0, 1))
+        val = min(40.0, round(self.current_pad_top + 1.0, 1))
         self.pad_top_slider.set(val)
         self._on_pad_top_slider_changed(val)
 
@@ -3018,7 +3102,7 @@ class StudioClipperApp(ctk.CTk):
         self._on_pad_bottom_slider_changed(val)
 
     def _pad_bottom_step_plus(self):
-        val = min(40.0, round(self.current_pad_bottom + 1.0, 1))
+        val = min(50.0, round(self.current_pad_bottom + 1.0, 1))
         self.pad_bottom_slider.set(val)
         self._on_pad_bottom_slider_changed(val)
 
@@ -3051,12 +3135,12 @@ class StudioClipperApp(ctk.CTk):
         self._update_scroll_region()
 
     def _fade_height_step_minus(self):
-        new_val = max(0.15, round(self.fade_height - 0.03, 2))
+        new_val = max(0.10, round(self.fade_height - 0.02, 2))
         self.fade_height_slider.set(new_val)
         self._on_fade_height_slider_changed(new_val)
 
     def _fade_height_step_plus(self):
-        new_val = min(0.70, round(self.fade_height + 0.03, 2))
+        new_val = min(1.00, round(self.fade_height + 0.02, 2))
         self.fade_height_slider.set(new_val)
         self._on_fade_height_slider_changed(new_val)
 
@@ -3079,15 +3163,62 @@ class StudioClipperApp(ctk.CTk):
         self.fade_opacity_slider.set(new_val)
         self._on_fade_opacity_slider_changed(new_val)
 
-    def _set_fade_preset(self, height: float, opacity: float):
+    def _on_fade_intensity_slider_changed(self, val):
+        self.fade_intensity = round(float(val), 2)
+        pct = int(round(self.fade_intensity * 100))
+        self.fade_intensity_label_var.set(f"Fade Intensity: {pct}% (Deep Contrast 🚀)")
+        self._sync_to_active_config()
+        self._render_visual_crop()
+        self._update_cli_display()
+        self._update_scroll_region()
+
+    def _fade_intensity_step_minus(self):
+        new_val = max(0.50, round(self.fade_intensity - 0.10, 2))
+        self.fade_intensity_slider.set(new_val)
+        self._on_fade_intensity_slider_changed(new_val)
+
+    def _fade_intensity_step_plus(self):
+        new_val = min(2.50, round(self.fade_intensity + 0.10, 2))
+        self.fade_intensity_slider.set(new_val)
+        self._on_fade_intensity_slider_changed(new_val)
+
+    def _on_fade_pos_y_slider_changed(self, val):
+        self.fade_pos_y = round(float(val), 2)
+        pct = int(round(self.fade_pos_y * 100))
+        self.fade_pos_y_label_var.set(f"Fade Vertical Shift: {pct}% ({'Bottom' if pct == 0 else f'Shifted Up {pct}%'})")
+        self._sync_to_active_config()
+        self._render_visual_crop()
+        self._update_cli_display()
+        self._update_scroll_region()
+
+    def _fade_pos_y_step_minus(self):
+        new_val = max(0.0, round(self.fade_pos_y - 0.02, 2))
+        self.fade_pos_y_slider.set(new_val)
+        self._on_fade_pos_y_slider_changed(new_val)
+
+    def _fade_pos_y_step_plus(self):
+        new_val = min(0.60, round(self.fade_pos_y + 0.02, 2))
+        self.fade_pos_y_slider.set(new_val)
+        self._on_fade_pos_y_slider_changed(new_val)
+
+    def _set_fade_preset(self, height: float, opacity: float, intensity: float = 1.3, pos_y: float = 0.0):
         self.fade_height = round(height, 2)
         self.fade_opacity = round(opacity, 2)
+        self.fade_intensity = round(intensity, 2)
+        self.fade_pos_y = round(pos_y, 2)
         if hasattr(self, "fade_height_slider"):
             self.fade_height_slider.set(self.fade_height)
             self.fade_height_label_var.set(f"Fade Spread: {int(round(self.fade_height * 100))}% (Coverage)")
         if hasattr(self, "fade_opacity_slider"):
             self.fade_opacity_slider.set(self.fade_opacity)
             self.fade_opacity_label_var.set(f"Fade Darkness: {int(round(self.fade_opacity * 100))}% (Contrast)")
+        if hasattr(self, "fade_intensity_slider"):
+            self.fade_intensity_slider.set(self.fade_intensity)
+            self.fade_intensity_label_var.set(f"Fade Intensity: {int(round(self.fade_intensity * 100))}% (Deep Contrast 🚀)")
+        if hasattr(self, "fade_pos_y_slider"):
+            self.fade_pos_y_slider.set(self.fade_pos_y)
+            fy_pct = int(round(self.fade_pos_y * 100))
+            self.fade_pos_y_label_var.set(f"Fade Vertical Shift: {fy_pct}% ({'Bottom' if fy_pct == 0 else f'Shifted Up {fy_pct}%'})")
         self._sync_to_active_config()
         self._render_visual_crop()
         self._update_cli_display()
@@ -3481,11 +3612,13 @@ class StudioClipperApp(ctk.CTk):
             pos_y=cur_pos_y,
             scale=cur_scale,
             pad_top=cur_pad_t,
-            pad_bottom=cur_pad_b
+            pad_bottom=cur_pad_b,
+            pad_mode=getattr(self, "pad_mode", "move_out")
         )
 
-        fade_status = "ON (🖤)" if bottom_fade_on else "OFF"
-        pad_status = f"Pad: T:{cur_pad_t:.1f}% B:{cur_pad_b:.1f}%"
+        fade_status = f"ON (🖤 {int(round(self.fade_height*100))}%/I:{int(round(getattr(self, 'fade_intensity', 1.3)*100))}%/Y:{int(round(getattr(self, 'fade_pos_y', 0.0)*100))}%)" if bottom_fade_on else "OFF"
+        pad_mode_tag = "Move Out" if getattr(self, "pad_mode", "move_out") == "move_out" else "Fit"
+        pad_status = f"Pad [{pad_mode_tag}]: T:{cur_pad_t:.1f}% B:{cur_pad_b:.1f}%"
         self.filter_info_label.configure(
             text=f"Mode: {mode_label} ({cur_ratio}) | FFmpeg: {crop_filter}\nFraming: Scale {cur_scale:.2f}x | X {int(cur_pos_x*100)}% | Y {int(cur_pos_y*100)}% | {pad_status} | Fade: {fade_status}"
         )
@@ -3579,11 +3712,26 @@ class StudioClipperApp(ctk.CTk):
 
             if base_frame:
                 crop_box = (off_x, off_y, off_x + crop_w, off_y + crop_h)
-                req_w = crop_base_w / cur_scale
-                req_h = crop_base_h / cur_scale
-                scale_fit = min(frame_w / req_w, vid_disp_h / req_h)
-                ui_disp_w = max(16, min(frame_w, int(round(crop_w * scale_fit))))
-                ui_disp_h = max(16, min(vid_disp_h, int(round(crop_h * scale_fit))))
+                if getattr(self, "pad_mode", "move_out") == "move_out":
+                    if cur_scale >= 1.0:
+                        ui_disp_w = frame_w
+                        ui_disp_h = vid_disp_h
+                        ui_pad_x = 0
+                        ui_pad_y = 0
+                    else:
+                        ui_disp_w = max(16, min(frame_w, int(round(frame_w * cur_scale))))
+                        ui_disp_h = max(16, min(vid_disp_h, int(round(vid_disp_h * cur_scale))))
+                        ui_pad_x = max(0, int(round((frame_w - ui_disp_w) * cur_pos_x)))
+                        ui_pad_y = max(0, int(round((vid_disp_h - ui_disp_h) * cur_pos_y)))
+                else:
+                    req_w = crop_base_w / cur_scale
+                    req_h = crop_base_h / cur_scale
+                    scale_fit = min(frame_w / req_w, vid_disp_h / req_h)
+                    ui_disp_w = max(16, min(frame_w, int(round(crop_w * scale_fit))))
+                    ui_disp_h = max(16, min(vid_disp_h, int(round(crop_h * scale_fit))))
+                    ui_pad_x = max(0, int(round((frame_w - ui_disp_w) * cur_pos_x)))
+                    ui_pad_y = max(0, int(round((vid_disp_h - ui_disp_h) * cur_pos_y)))
+
                 ui_disp_w -= (ui_disp_w % 2)
                 ui_disp_h -= (ui_disp_h % 2)
 
@@ -3592,11 +3740,6 @@ class StudioClipperApp(ctk.CTk):
                 except Exception:
                     cropped_frame = base_frame.resize((ui_disp_w, ui_disp_h), Image.Resampling.LANCZOS)
 
-                ui_pad_x = max(0, int(round((frame_w - ui_disp_w) * cur_pos_x)))
-                ui_pad_y = max(0, int(round((vid_disp_h - ui_disp_h) * cur_pos_y)))
-                ui_pad_x -= (ui_pad_x % 2)
-                ui_pad_y -= (ui_pad_y % 2)
-
                 bg.paste(cropped_frame, (rx1 + ui_pad_x, ry1 + pad_t_px + ui_pad_y))
             else:
                 cropped_frame = Image.new("RGBA", (frame_w, vid_disp_h), (40, 50, 70, 255))
@@ -3604,15 +3747,26 @@ class StudioClipperApp(ctk.CTk):
 
             # Draw bottom black fade gradient if enabled
             if bottom_fade_on and vid_disp_h > 20:
-                fade_h = max(6, int(vid_disp_h * fade_h_val))
-                fade_top = vid_disp_h - fade_h
-                col = Image.new("RGBA", (1, fade_h), (0, 0, 0, 0))
-                for y_idx in range(fade_h):
-                    norm = y_idx / max(1, fade_h - 1)
-                    alpha = int(255 * fade_o_val * (norm ** 1.35))
+                fade_h = max(6, int(vid_disp_h * max(0.05, min(1.0, fade_h_val))))
+                fade_y_shift = int(vid_disp_h * max(0.0, min(0.60, getattr(self, "fade_pos_y", 0.0))))
+                fade_intensity_val = getattr(self, "fade_intensity", 1.3)
+                exponent = max(0.25, 1.35 / max(0.1, fade_intensity_val))
+                max_alpha = int(round(255 * max(0.1, min(1.0, fade_o_val))))
+
+                fade_bottom = max(fade_h, vid_disp_h - fade_y_shift)
+                fade_top = max(0, fade_bottom - fade_h)
+                actual_fade_h = max(1, fade_bottom - fade_top)
+
+                col = Image.new("RGBA", (1, actual_fade_h), (0, 0, 0, 0))
+                for y_idx in range(actual_fade_h):
+                    norm = y_idx / max(1, actual_fade_h - 1)
+                    alpha = int(max_alpha * (norm ** exponent))
                     col.putpixel((0, y_idx), (0, 0, 0, min(255, max(0, alpha))))
-                fade_img = col.resize((frame_w, fade_h), Image.Resampling.NEAREST)
+                fade_img = col.resize((frame_w, actual_fade_h), Image.Resampling.NEAREST)
                 bg.paste(fade_img, (rx1, ry1 + pad_t_px + fade_top), fade_img)
+
+                if fade_bottom < vid_disp_h:
+                    d_bg.rectangle([rx1, ry1 + pad_t_px + fade_bottom, rx2, ry1 + pad_t_px + vid_disp_h], fill=(0, 0, 0, max_alpha))
 
             # Draw sample caption text on preview
             draw_cap = ImageDraw.Draw(bg)
@@ -3809,16 +3963,27 @@ class StudioClipperApp(ctk.CTk):
 
             if bottom_fade_on and (box_y2 > box_y1) and (box_x2 > box_x1):
                 box_h = box_y2 - box_y1
-                fade_h = max(4, int(box_h * fade_h_val))
-                fade_top = max(box_y1, box_y2 - fade_h)
-                actual_fade_h = box_y2 - fade_top
+                fade_intensity_val = getattr(self, "fade_intensity", 1.3)
+                fade_y_shift_px = int(box_h * max(0.0, min(0.60, getattr(self, "fade_pos_y", 0.0))))
+                exponent = max(0.25, 1.35 / max(0.1, fade_intensity_val))
+                max_alpha = int(round(255 * max(0.1, min(1.0, fade_o_val))))
+
+                fade_h = max(4, int(box_h * max(0.05, min(1.0, fade_h_val))))
+                fade_bottom = max(box_y1 + fade_h, box_y2 - fade_y_shift_px)
+                fade_top = max(box_y1, fade_bottom - fade_h)
+                actual_fade_h = max(1, fade_bottom - fade_top)
+
                 fade_col = Image.new("RGBA", (1, actual_fade_h), (0, 0, 0, 0))
                 for y_idx in range(actual_fade_h):
                     norm = y_idx / max(1, actual_fade_h - 1)
-                    alpha = int(255 * fade_o_val * (norm ** 1.35))
+                    alpha = int(max_alpha * (norm ** exponent))
                     fade_col.putpixel((0, y_idx), (0, 0, 0, min(255, max(0, alpha))))
                 fade_box = fade_col.resize((box_x2 - box_x1, actual_fade_h), Image.Resampling.NEAREST)
                 img_composite.paste(fade_box, (box_x1, fade_top), fade_box)
+
+                if fade_bottom < box_y2:
+                    draw_under = ImageDraw.Draw(img_composite)
+                    draw_under.rectangle([box_x1, fade_bottom, box_x2, box_y2], fill=(0, 0, 0, max_alpha))
 
             draw_box = ImageDraw.Draw(img_composite)
             box_col = (99, 102, 241, 255) if self.active_mode == "shorts" else (56, 189, 248, 255)
@@ -3853,13 +4018,21 @@ class StudioClipperApp(ctk.CTk):
             parts.append(f'--pad-top {active_cfg["pad_top"]:.1f}')
         if active_cfg["pad_bottom"] > 0:
             parts.append(f'--pad-bottom {active_cfg["pad_bottom"]:.1f}')
+        if active_cfg.get("pad_mode", "move_out") != "move_out":
+            parts.append(f'--pad-mode {active_cfg["pad_mode"]}')
 
         if active_cfg["bottom_fade"]:
             parts.append('--bottom-fade')
             fade_h = active_cfg.get("fade_height", self.fade_height)
             fade_o = active_cfg.get("fade_opacity", self.fade_opacity)
+            fade_i = active_cfg.get("fade_intensity", getattr(self, "fade_intensity", 1.3))
+            fade_y = active_cfg.get("fade_pos_y", getattr(self, "fade_pos_y", 0.0))
             parts.append(f'--fade-height {fade_h:.2f}')
             parts.append(f'--fade-opacity {fade_o:.2f}')
+            if abs(fade_i - 1.0) > 0.01:
+                parts.append(f'--fade-intensity {fade_i:.2f}')
+            if fade_y > 0.001:
+                parts.append(f'--fade-y {fade_y:.2f}')
 
         srt = self.srt_entry.get().strip()
         if self.sub_switch_var.get() and srt and os.path.exists(srt):
@@ -3947,7 +4120,8 @@ class StudioClipperApp(ctk.CTk):
                     pos_y=active_cfg["pos_y"],
                     scale=active_cfg["scale"],
                     pad_top=active_cfg["pad_top"],
-                    pad_bottom=active_cfg["pad_bottom"]
+                    pad_bottom=active_cfg["pad_bottom"],
+                    pad_mode=active_cfg.get("pad_mode", getattr(self, "pad_mode", "move_out"))
                 )
 
             srt = self.srt_entry.get().strip()
@@ -3968,6 +4142,11 @@ class StudioClipperApp(ctk.CTk):
             use_noise = (self.yt_noise_removal_var.get() if hasattr(self, "yt_noise_removal_var") and getattr(self, "yt_enabled", False) else False)
             noise_int = getattr(self, "yt_noise_intensity", "Medium")
 
+            fade_h = active_cfg.get("fade_height", self.fade_height)
+            fade_o = active_cfg.get("fade_opacity", self.fade_opacity)
+            fade_i = active_cfg.get("fade_intensity", getattr(self, "fade_intensity", 1.3))
+            fade_y = active_cfg.get("fade_pos_y", getattr(self, "fade_pos_y", 0.0))
+
             run_pipeline(
                 video_path=self.video_path,
                 output_path=preview_file,
@@ -3983,8 +4162,10 @@ class StudioClipperApp(ctk.CTk):
                 caption_style=cap_style,
                 caption_border=cap_border,
                 bottom_fade=active_cfg["bottom_fade"],
-                fade_height=active_cfg.get("fade_height", self.fade_height),
-                fade_opacity=active_cfg.get("fade_opacity", self.fade_opacity),
+                fade_height=fade_h,
+                fade_opacity=fade_o,
+                fade_intensity=fade_i,
+                fade_pos_y=fade_y,
                 sub_margin_v=None,
                 audio_path=audio if use_audio else None,
                 sub_pos_y=sub_y,
@@ -4063,7 +4244,8 @@ class StudioClipperApp(ctk.CTk):
                     pos_y=active_cfg["pos_y"],
                     scale=active_cfg["scale"],
                     pad_top=active_cfg["pad_top"],
-                    pad_bottom=active_cfg["pad_bottom"]
+                    pad_bottom=active_cfg["pad_bottom"],
+                    pad_mode=active_cfg.get("pad_mode", getattr(self, "pad_mode", "move_out"))
                 )
 
             srt = self.srt_entry.get().strip()
@@ -4102,6 +4284,11 @@ class StudioClipperApp(ctk.CTk):
             use_noise = (self.yt_noise_removal_var.get() if hasattr(self, "yt_noise_removal_var") and getattr(self, "yt_enabled", False) else False)
             noise_int = getattr(self, "yt_noise_intensity", "Medium")
 
+            fade_h = active_cfg.get("fade_height", self.fade_height)
+            fade_o = active_cfg.get("fade_opacity", self.fade_opacity)
+            fade_i = active_cfg.get("fade_intensity", getattr(self, "fade_intensity", 1.3))
+            fade_y = active_cfg.get("fade_pos_y", getattr(self, "fade_pos_y", 0.0))
+
             generate_3segment_preview(
                 video_path=self.video_path,
                 output_path=preview_file,
@@ -4117,8 +4304,10 @@ class StudioClipperApp(ctk.CTk):
                 font_size=font_sz,
                 caption_border=cap_border,
                 bottom_fade=active_cfg["bottom_fade"],
-                fade_height=active_cfg.get("fade_height", self.fade_height),
-                fade_opacity=active_cfg.get("fade_opacity", self.fade_opacity),
+                fade_height=fade_h,
+                fade_opacity=fade_o,
+                fade_intensity=fade_i,
+                fade_pos_y=fade_y,
                 sub_margin_v=None,
                 cancel_check=cancel_checker,
                 proc_callback=set_proc,
@@ -4419,7 +4608,8 @@ class StudioClipperApp(ctk.CTk):
                 pos_y=s_cfg["pos_y"],
                 scale=s_cfg["scale"],
                 pad_top=s_cfg["pad_top"],
-                pad_bottom=s_cfg["pad_bottom"]
+                pad_bottom=s_cfg["pad_bottom"],
+                pad_mode=s_cfg.get("pad_mode", "move_out")
             )
 
             # Pre-compute Videos crop filter from Videos profile
@@ -4436,7 +4626,8 @@ class StudioClipperApp(ctk.CTk):
                     pos_y=v_cfg["pos_y"],
                     scale=v_cfg["scale"],
                     pad_top=v_cfg["pad_top"],
-                    pad_bottom=v_cfg["pad_bottom"]
+                    pad_bottom=v_cfg["pad_bottom"],
+                    pad_mode=v_cfg.get("pad_mode", "move_out")
                 )
 
             srt = self.srt_entry.get().strip()
@@ -4486,15 +4677,19 @@ class StudioClipperApp(ctk.CTk):
                     ratio_tag = f"{v_cfg['ratio_val']} Video"
                     dur_display = f"{dur/60:.1f}m"
                     clip_fade = v_cfg["bottom_fade"]
-                    clip_fade_h = v_cfg.get("fade_height", 0.38)
-                    clip_fade_o = v_cfg.get("fade_opacity", 0.92)
+                    clip_fade_h = v_cfg.get("fade_height", 0.40)
+                    clip_fade_o = v_cfg.get("fade_opacity", 0.95)
+                    clip_fade_i = v_cfg.get("fade_intensity", 1.3)
+                    clip_fade_y = v_cfg.get("fade_pos_y", 0.0)
                 else:
                     chosen_crop = shorts_crop_filter
                     ratio_tag = f"{s_cfg['ratio_val']} Shorts"
                     dur_display = f"{dur:.1f}s"
                     clip_fade = s_cfg["bottom_fade"]
-                    clip_fade_h = s_cfg.get("fade_height", 0.38)
-                    clip_fade_o = s_cfg.get("fade_opacity", 0.92)
+                    clip_fade_h = s_cfg.get("fade_height", 0.40)
+                    clip_fade_o = s_cfg.get("fade_opacity", 0.95)
+                    clip_fade_i = s_cfg.get("fade_intensity", 1.3)
+                    clip_fade_y = s_cfg.get("fade_pos_y", 0.0)
 
                 status_txt = f"[{idx}/{total}] 🎬 Cutting [{ratio_tag}]: {entry['title']} ({dur_display})..."
                 self.after(0, lambda p=progress_val, s=status_txt: self._update_batch_progress(p, s))
@@ -4526,6 +4721,8 @@ class StudioClipperApp(ctk.CTk):
                     bottom_fade=clip_fade,
                     fade_height=clip_fade_h,
                     fade_opacity=clip_fade_o,
+                    fade_intensity=clip_fade_i,
+                    fade_pos_y=clip_fade_y,
                     sub_margin_v=None,
                     cancel_check=check_cancel,
                     proc_callback=set_proc,

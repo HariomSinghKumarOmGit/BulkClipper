@@ -512,8 +512,10 @@ def extract_pad_info(crop_filter: Optional[str]) -> Tuple[int, int, int, int]:
 
 
 def get_bottom_fade_asset(
-    fade_height_frac: float = 0.38,
-    max_opacity: float = 0.92,
+    fade_height_frac: float = 0.40,
+    max_opacity: float = 0.95,
+    fade_intensity: float = 1.3,
+    fade_pos_y: float = 0.0,
     total_w: int = 1080,
     total_h: int = 1920,
     pad_top_px: int = 0,
@@ -522,33 +524,46 @@ def get_bottom_fade_asset(
     """
     Returns path to a PNG gradient asset for bottom caption contrast.
     If not already on disk, generates it via Pillow automatically.
+    Supports adjustable spread (height %), intensity (contrast curve), and vertical shift.
     Seamlessly blends into bottom frame padding (letterboxing).
     """
     h_pct = int(round(fade_height_frac * 100))
     o_pct = int(round(max_opacity * 100))
-    fname = f"bottom_fade_{total_w}x{total_h}_t{pad_top_px}_b{pad_bottom_px}_h{h_pct}_o{o_pct}.png"
+    i_pct = int(round(fade_intensity * 100))
+    y_pct = int(round(fade_pos_y * 100))
+    fname = f"bottom_fade_{total_w}x{total_h}_t{pad_top_px}_b{pad_bottom_px}_h{h_pct}_o{o_pct}_i{i_pct}_y{y_pct}.png"
     grad_path = ASSETS_DIR / fname
     if grad_path.exists() and grad_path.stat().st_size > 500:
         return str(grad_path)
 
     w, h = total_w, total_h
     video_h = max(64, h - pad_top_px - pad_bottom_px)
-    fade_px = int(video_h * max(0.1, min(0.8, fade_height_frac)))
-    fade_start = max(pad_top_px, (h - pad_bottom_px) - fade_px)
-    fade_end = h - pad_bottom_px
+    fade_px = int(video_h * max(0.05, min(1.0, fade_height_frac)))
+    fade_y_shift = int(video_h * max(0.0, min(0.60, fade_pos_y)))
+
+    fade_end = max(pad_top_px + 32, (h - pad_bottom_px) - fade_y_shift)
+    fade_start = max(pad_top_px, fade_end - fade_px)
 
     from PIL import Image
     col = Image.new("RGBA", (1, h), (0, 0, 0, 0))
     putpixel = col.putpixel
 
+    # Exponent for intensity: higher intensity -> faster ramp to deep, rich black
+    exponent = max(0.25, 1.35 / max(0.1, fade_intensity))
+    max_alpha = int(round(255 * max(0.1, min(1.0, max_opacity))))
+
     # Fade region on video
     for y in range(fade_start, fade_end):
         norm = (y - fade_start) / max(1, (fade_end - fade_start))
-        alpha = int(255 * max_opacity * (norm ** 1.35))
+        alpha = int(max_alpha * (norm ** exponent))
         putpixel((0, y), (0, 0, 0, min(255, max(0, alpha))))
 
+    # Below fade_end down to bottom padding line: solid dark matching max_alpha
+    for y in range(fade_end, h - pad_bottom_px):
+        putpixel((0, y), (0, 0, 0, min(255, max_alpha)))
+
     # Below video (bottom padding) is solid black
-    for y in range(fade_end, h):
+    for y in range(h - pad_bottom_px, h):
         putpixel((0, y), (0, 0, 0, 255))
 
     full_grad = col.resize((w, h), Image.Resampling.NEAREST)
@@ -581,15 +596,18 @@ def compute_crop_filter(
     pos_y: float = 0.5,
     scale: float = 1.0,
     pad_top: float = 0.0,
-    pad_bottom: float = 0.0
+    pad_bottom: float = 0.0,
+    pad_mode: str = "move_out"
 ) -> Tuple[str, int, int, int, int]:
     """
     Computes ffmpeg crop/scale/pad filter string ensuring even dimensions.
     pos_x: 0.0 = left, 0.5 = center, 1.0 = right
     pos_y: 0.0 = top, 0.5 = center, 1.0 = bottom
     scale: 1.0 = standard framing, >1.0 = scale up / zoom in, <1.0 = scale down / fit / pad
-    pad_top: Top frame padding percentage (0.0 to 40.0%)
+    pad_top: Top frame padding percentage (0.0 to 50.0%)
     pad_bottom: Bottom frame padding percentage (0.0 to 50.0%)
+    pad_mode: "move_out" = clip moves out of frame (full width maintained, no shrinking),
+              "letterbox" = video scales down to fit inside remaining window.
     Returns:
         filter_str, crop_w, crop_h, offset_x, offset_y
     """
@@ -625,7 +643,7 @@ def compute_crop_filter(
     base_h -= (base_h % 2)
 
     # Frame Padding Calculation (Top and Bottom Letterboxing)
-    pad_top_pct = max(0.0, min(40.0, float(pad_top)))
+    pad_top_pct = max(0.0, min(50.0, float(pad_top)))
     pad_bottom_pct = max(0.0, min(50.0, float(pad_bottom)))
 
     pad_top_px = int(round(base_h * (pad_top_pct / 100.0)))
@@ -634,71 +652,132 @@ def compute_crop_filter(
     pad_bottom_px -= (pad_bottom_px % 2)
 
     avail_w = base_w
-    avail_h = max(64, base_h - pad_top_px - pad_bottom_px)
+    avail_h = max(32, base_h - pad_top_px - pad_bottom_px)
     avail_h -= (avail_h % 2)
-    sub_aspect = avail_w / avail_h
-
-    if in_aspect > sub_aspect:
-        crop_base_h = in_h
-        crop_base_w = int(round(in_h * sub_aspect))
-    else:
-        crop_base_w = in_w
-        crop_base_h = int(round(in_w / sub_aspect))
-
-    crop_base_w -= (crop_base_w % 2)
-    crop_base_h -= (crop_base_h % 2)
 
     scale = max(0.2, min(5.0, float(scale)))
     pos_x = max(0.0, min(1.0, float(pos_x)))
     pos_y = max(0.0, min(1.0, float(pos_y)))
 
-    # Unified continuous zoom model:
-    # req_w and req_h represent the unconstrained framing window in source space
-    req_w = crop_base_w / scale
-    req_h = crop_base_h / scale
+    if pad_mode == "move_out":
+        # --- MOVE OUT OF FRAME MODE (Clip maintains full scale, padding moves clip out of frame) ---
+        req_w = base_w / scale
+        req_h = avail_h / scale
 
-    # Actual crop dimensions taken from source cannot exceed source bounds
-    cw = int(round(min(float(in_w), req_w)))
-    ch = int(round(min(float(in_h), req_h)))
-    cw -= (cw % 2)
-    ch -= (ch % 2)
-    cw = max(16, min(in_w, cw))
-    ch = max(16, min(in_h, ch))
+        cw = int(round(min(float(in_w), req_w)))
+        ch = int(round(min(float(in_h), req_h)))
+        cw -= (cw % 2)
+        ch -= (ch % 2)
+        cw = max(16, min(in_w, cw))
+        ch = max(16, min(in_h, ch))
 
-    # Panning offsets in source space
-    max_x = max(0, in_w - cw)
-    max_y = max(0, in_h - ch)
-    off_x = int(round(max_x * pos_x))
-    off_y = int(round(max_y * pos_y))
-    off_x -= (off_x % 2)
-    off_y -= (off_y % 2)
+        max_x = max(0, in_w - cw)
+        max_y = max(0, in_h - ch)
+        off_x = int(round(max_x * pos_x))
+        off_y = int(round(max_y * pos_y))
+        off_x -= (off_x % 2)
+        off_y -= (off_y % 2)
 
-    # Scale factor from source crop to output active window
-    scale_fit = min(avail_w / req_w, avail_h / req_h)
-    disp_w = int(round(cw * scale_fit))
-    disp_h = int(round(ch * scale_fit))
-    disp_w -= (disp_w % 2)
-    disp_h -= (disp_h % 2)
-    disp_w = max(16, min(avail_w, disp_w))
-    disp_h = max(16, min(avail_h, disp_h))
+        # If padding is 0 and pos_y != 0.5, allow vertical framing to shift clip out of frame
+        if pad_top_px == 0 and pad_bottom_px == 0 and max_y == 0 and abs(pos_y - 0.5) > 0.01:
+            if pos_y < 0.5:
+                shift_px = int(round(base_h * (0.5 - pos_y) * 0.40))
+                shift_px -= (shift_px % 2)
+                ch = max(32, base_h - shift_px)
+                ch -= (ch % 2)
+                off_y = shift_px
+                pad_bottom_px = shift_px
+                avail_h = ch
+            else:
+                shift_px = int(round(base_h * (pos_y - 0.5) * 0.40))
+                shift_px -= (shift_px % 2)
+                ch = max(32, base_h - shift_px)
+                ch -= (ch % 2)
+                off_y = 0
+                pad_top_px = shift_px
+                avail_h = ch
 
-    # Center or position display within available window
-    pad_in_avail_x = max(0, int(round((avail_w - disp_w) * pos_x)))
-    pad_in_avail_y = max(0, int(round((avail_h - disp_h) * pos_y)))
-    pad_in_avail_x -= (pad_in_avail_x % 2)
-    pad_in_avail_y -= (pad_in_avail_y % 2)
+        if scale >= 1.0:
+            disp_w = base_w
+            disp_h = avail_h
+        else:
+            disp_w = int(round(base_w * scale))
+            disp_h = int(round(avail_h * scale))
+            disp_w -= (disp_w % 2)
+            disp_h -= (disp_h % 2)
+            disp_w = max(16, min(avail_w, disp_w))
+            disp_h = max(16, min(avail_h, disp_h))
 
-    total_pad_x = pad_in_avail_x
-    total_pad_y = pad_top_px + pad_in_avail_y
+        pad_in_avail_x = max(0, int(round((avail_w - disp_w) * pos_x)))
+        pad_in_avail_y = max(0, int(round((avail_h - disp_h) * pos_y)))
+        pad_in_avail_x -= (pad_in_avail_x % 2)
+        pad_in_avail_y -= (pad_in_avail_y % 2)
 
-    parts = [f"crop={cw}:{ch}:{off_x}:{off_y}"]
-    if disp_w != cw or disp_h != ch:
-        parts.append(f"scale={disp_w}:{disp_h}")
-    if disp_w < base_w or disp_h < base_h or total_pad_x > 0 or total_pad_y > 0:
-        parts.append(f"pad={base_w}:{base_h}:{total_pad_x}:{total_pad_y}:color=black")
+        total_pad_x = pad_in_avail_x
+        total_pad_y = pad_top_px + pad_in_avail_y
 
-    filter_str = ",".join(parts)
-    return filter_str, cw, ch, off_x, off_y
+        parts = [f"crop={cw}:{ch}:{off_x}:{off_y}"]
+        if disp_w != cw or disp_h != ch:
+            parts.append(f"scale={disp_w}:{disp_h}")
+        if disp_w < base_w or disp_h < base_h or total_pad_x > 0 or total_pad_y > 0:
+            parts.append(f"pad={base_w}:{base_h}:{total_pad_x}:{total_pad_y}:color=black")
+
+        return ",".join(parts), cw, ch, off_x, off_y
+
+    else:
+        # --- LETTERBOX (FIT) MODE ---
+        sub_aspect = avail_w / avail_h
+        if in_aspect > sub_aspect:
+            crop_base_h = in_h
+            crop_base_w = int(round(in_h * sub_aspect))
+        else:
+            crop_base_w = in_w
+            crop_base_h = int(round(in_w / sub_aspect))
+
+        crop_base_w -= (crop_base_w % 2)
+        crop_base_h -= (crop_base_h % 2)
+
+        req_w = crop_base_w / scale
+        req_h = crop_base_h / scale
+
+        cw = int(round(min(float(in_w), req_w)))
+        ch = int(round(min(float(in_h), req_h)))
+        cw -= (cw % 2)
+        ch -= (ch % 2)
+        cw = max(16, min(in_w, cw))
+        ch = max(16, min(in_h, ch))
+
+        max_x = max(0, in_w - cw)
+        max_y = max(0, in_h - ch)
+        off_x = int(round(max_x * pos_x))
+        off_y = int(round(max_y * pos_y))
+        off_x -= (off_x % 2)
+        off_y -= (off_y % 2)
+
+        scale_fit = min(avail_w / req_w, avail_h / req_h)
+        disp_w = int(round(cw * scale_fit))
+        disp_h = int(round(ch * scale_fit))
+        disp_w -= (disp_w % 2)
+        disp_h -= (disp_h % 2)
+        disp_w = max(16, min(avail_w, disp_w))
+        disp_h = max(16, min(avail_h, disp_h))
+
+        pad_in_avail_x = max(0, int(round((avail_w - disp_w) * pos_x)))
+        pad_in_avail_y = max(0, int(round((avail_h - disp_h) * pos_y)))
+        pad_in_avail_x -= (pad_in_avail_x % 2)
+        pad_in_avail_y -= (pad_in_avail_y % 2)
+
+        total_pad_x = pad_in_avail_x
+        total_pad_y = pad_top_px + pad_in_avail_y
+
+        parts = [f"crop={cw}:{ch}:{off_x}:{off_y}"]
+        if disp_w != cw or disp_h != ch:
+            parts.append(f"scale={disp_w}:{disp_h}")
+        if disp_w < base_w or disp_h < base_h or total_pad_x > 0 or total_pad_y > 0:
+            parts.append(f"pad={base_w}:{base_h}:{total_pad_x}:{total_pad_y}:color=black")
+
+        filter_str = ",".join(parts)
+        return filter_str, cw, ch, off_x, off_y
 
 
 def escape_ffmpeg_path(path: str) -> str:
@@ -732,8 +811,10 @@ def run_pipeline(
     caption_border: Optional[str] = None,
     bitrate: str = "5000k",
     bottom_fade: bool = False,
-    fade_height: float = 0.38,
-    fade_opacity: float = 0.92,
+    fade_height: float = 0.40,
+    fade_opacity: float = 0.95,
+    fade_intensity: float = 1.3,
+    fade_pos_y: float = 0.0,
     sub_margin_v: Optional[int] = None,
     cancel_check: Optional[Any] = None,
     proc_callback: Optional[Any] = None,
@@ -822,6 +903,8 @@ def run_pipeline(
         grad_asset = get_bottom_fade_asset(
             fade_height_frac=fade_height,
             max_opacity=fade_opacity,
+            fade_intensity=fade_intensity,
+            fade_pos_y=fade_pos_y,
             total_w=out_w,
             total_h=out_h,
             pad_top_px=pad_top_px,
@@ -1161,8 +1244,10 @@ def generate_3segment_preview(
     caption_border: Optional[str] = None,
     bitrate: str = "5000k",
     bottom_fade: bool = False,
-    fade_height: float = 0.38,
-    fade_opacity: float = 0.92,
+    fade_height: float = 0.40,
+    fade_opacity: float = 0.95,
+    fade_intensity: float = 1.3,
+    fade_pos_y: float = 0.0,
     sub_margin_v: Optional[int] = None,
     cancel_check: Optional[Any] = None,
     proc_callback: Optional[Any] = None,
@@ -1243,6 +1328,8 @@ def generate_3segment_preview(
                 bottom_fade=bottom_fade,
                 fade_height=fade_height,
                 fade_opacity=fade_opacity,
+                fade_intensity=fade_intensity,
+                fade_pos_y=fade_pos_y,
                 sub_margin_v=sub_margin_v,
                 cancel_check=cancel_check,
                 proc_callback=proc_callback,
@@ -1298,11 +1385,14 @@ def main():
     parser.add_argument("--pos-y", type=float, default=0.5, help="Vertical crop position (0.0=top, 0.5=center, 1.0=bottom)")
     parser.add_argument("--pad-top", type=float, default=0.0, help="Top frame padding percentage (default: 0.0)")
     parser.add_argument("--pad-bottom", type=float, default=0.0, help="Bottom frame padding percentage (default: 0.0)")
+    parser.add_argument("--pad-mode", default="move_out", choices=["move_out", "letterbox"], help="Padding mode: 'move_out' keeps full scale and moves clip out of frame, 'letterbox' fits clip inside window")
     parser.add_argument("--sub-margin", type=int, default=None, help="Vertical margin for subtitles (defaults to pad_bottom + 35)")
     parser.add_argument("--sub-pos-y", type=float, default=None, help="Vertical position for subtitles as fraction from bottom (0.0 to 1.0, e.g. 0.15 for 15%%, 0.5 for center)")
     parser.add_argument("--bottom-fade", "--black-fade", dest="bottom_fade", action="store_true", default=False, help="Add smooth bottom black fade gradient for caption contrast")
-    parser.add_argument("--fade-height", type=float, default=0.38, help="Fraction of frame height for bottom black fade (default: 0.38)")
-    parser.add_argument("--fade-opacity", type=float, default=0.92, help="Maximum opacity of bottom black fade (default: 0.92)")
+    parser.add_argument("--fade-height", type=float, default=0.40, help="Fraction of frame height for bottom black fade (0.05 to 1.0, default: 0.40)")
+    parser.add_argument("--fade-opacity", type=float, default=0.95, help="Maximum opacity of bottom black fade (default: 0.95)")
+    parser.add_argument("--fade-intensity", type=float, default=1.3, help="Intensity / contrast multiplier for bottom black fade (default: 1.3)")
+    parser.add_argument("--fade-y", "--fade-pos-y", dest="fade_pos_y", type=float, default=0.0, help="Vertical shift / position for bottom black fade (0.0 to 0.6, default: 0.0)")
     parser.add_argument("-s", "--srt", "--sub", dest="srt", help="Path to subtitle or lyrics file (.srt, .ass, .lrc, .vtt)")
     parser.add_argument("-a", "--audio", help="Path to high-quality / separate main audio file (.m4a, .mp3, .wav, .aac, .opus) to replace or supply video audio")
     parser.add_argument("--video-volume", type=float, default=1.0, help="Main video / audio volume multiplier (1.0 = normal, 1.5 = 150%%, 2.0 = 200%%)")
@@ -1337,7 +1427,8 @@ def main():
             pos_y=args.pos_y,
             scale=args.scale,
             pad_top=args.pad_top,
-            pad_bottom=args.pad_bottom
+            pad_bottom=args.pad_bottom,
+            pad_mode=args.pad_mode
         )
     else:
         crop_filter = None
@@ -1362,6 +1453,8 @@ def main():
             bottom_fade=args.bottom_fade,
             fade_height=args.fade_height,
             fade_opacity=args.fade_opacity,
+            fade_intensity=args.fade_intensity,
+            fade_pos_y=args.fade_pos_y,
             sub_margin_v=args.sub_margin,
             audio_path=args.audio,
             sub_pos_y=args.sub_pos_y,
@@ -1388,6 +1481,8 @@ def main():
             bottom_fade=args.bottom_fade,
             fade_height=args.fade_height,
             fade_opacity=args.fade_opacity,
+            fade_intensity=args.fade_intensity,
+            fade_pos_y=args.fade_pos_y,
             sub_margin_v=args.sub_margin,
             audio_path=args.audio,
             sub_pos_y=args.sub_pos_y,
