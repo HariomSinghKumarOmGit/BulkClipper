@@ -109,15 +109,19 @@ def run_folder_system(
     font_size = int(''.join(c for c in font_size_str if c.isdigit()) or 22)
     caption_border = sub_cfg.get("border", "Auto (Preset Default)")
     caption_pos = sub_cfg.get("position", "Caption: On Video Fade (Above Padding)")
+    sub_pos_y = float(sub_cfg.get("pos_y", 0.06 if "Inside Black" in caption_pos else 0.15))
+    caption_overflow = bool(sub_cfg.get("overflow", False))
 
     shorts_ratio = ratio or s_cfg["ratio_val"]
     music_cfg = cfg.get("music", {})
     universal_vol = volume if volume is not None else music_cfg.get("volume", s_cfg.get("vol", 0.12))
+    universal_video_vol = float(cfg.get("audio", {}).get("video_volume", 1.0))
 
     print("\n" + "=" * 65)
     print(f"📂 1-CLICK FOLDER AUTO-RUN: {folder.name}")
     print(f"⚙️  Using Saved Config: Shorts [{shorts_ratio}], Videos [{v_cfg['ratio_val']}]")
     print(f"💬 Caption Style      : {caption_style} | Font: {font_name} ({font_size}pt) | Border: {caption_border}")
+    print(f"🔊 Main Video Sound   : {int(round(universal_video_vol * 100))}% ({universal_video_vol:.2f}x)")
     print(f"🎵 Background Music   : Universal Volume {int(round(universal_vol * 100))}%")
     print("=" * 65)
 
@@ -218,6 +222,7 @@ def run_folder_system(
             srt_path=str(sub_path) if sub_path else None,
             music_path=str(audio_path) if audio_path else None,
             music_volume=clip_vol,
+            video_volume=universal_video_vol,
             start_sec=entry["start_sec"],
             duration_sec=dur,
             use_hw_accel=True,
@@ -228,7 +233,9 @@ def run_folder_system(
             bottom_fade=clip_fade,
             fade_height=clip_fade_h,
             fade_opacity=clip_fade_o,
-            sub_margin_v=clip_sub_margin
+            sub_margin_v=clip_sub_margin,
+            sub_pos_y=sub_pos_y,
+            caption_overflow=caption_overflow
         )
 
         extract_thumbnail(str(out_vid), str(out_thumb), offset_sec=min(5.0, max(0.5, dur / 2.0)))

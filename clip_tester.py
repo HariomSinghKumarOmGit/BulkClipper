@@ -325,9 +325,18 @@ def render_clip(
     # Input 0: Main Video sliced accurately
     inputs.extend(["-ss", f"{start_sec:.3f}", "-t", f"{duration_sec:.3f}", "-i", video_path])
 
-    # Input 1: Background Music (looped indefinitely if present)
+    # Input 1: Background Music (looped if shorter than duration, else combined)
     if has_music:
-        inputs.extend(["-stream_loop", "-1", "-i", music_path])
+        try:
+            from process_full import probe_audio
+            m_info = probe_audio(music_path)
+            m_dur = m_info.get("duration", 0.0)
+            should_loop = (m_dur > 0 and duration_sec > 0 and m_dur < duration_sec)
+        except Exception:
+            should_loop = True
+        if should_loop:
+            inputs.extend(["-stream_loop", "-1"])
+        inputs.extend(["-i", music_path])
 
     filter_chains = []
 
@@ -349,12 +358,12 @@ def render_clip(
     if has_music and has_vid_audio:
         # Scale background music, mix with video audio (speech stays at 100% via normalize=0)
         filter_chains.append("[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a0_clean]")
-        filter_chains.append(f"[1:a]volume={music_volume:.3f}[bg_ducked]")
+        filter_chains.append(f"[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,volume={music_volume:.3f}[bg_ducked]")
         filter_chains.append("[a0_clean][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]")
         audio_map = "[a_out]"
     elif has_music and not has_vid_audio:
         # No audio in video, only background music
-        filter_chains.append(f"[1:a]volume={music_volume:.3f}[a_out]")
+        filter_chains.append(f"[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,volume={music_volume:.3f}[a_out]")
         audio_map = "[a_out]"
     elif not has_music and has_vid_audio:
         filter_chains.append("[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a_out]")

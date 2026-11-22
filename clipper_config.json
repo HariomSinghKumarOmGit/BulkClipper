@@ -1,50 +1,60 @@
 {
-  "active_mode": "videos",
+  "active_mode": "shorts",
   "shorts_config": {
-    "video_path": "/Users/hariomsingh/Downloads/ Spiritual Karim is live 01 March 2026.mp4",
+    "video_path": "/Users/hariomsingh/Desktop/mycliper/downloaded_videos/Spiritual Karim is live 28 Apr 2025.mp4",
     "ratio_str": "9:16 (Shorts/Reels)",
     "ratio_val": "9:16",
-    "scale": 1.0,
-    "pos_x": 0.5,
-    "pos_y": 0.467,
+    "scale": 0.98,
+    "pos_x": 0.54,
+    "pos_y": 0.0,
     "pad_top": 0.0,
-    "pad_bottom": 12.0,
+    "pad_bottom": 5.0,
     "bottom_fade": true,
-    "fade_height": 0.54,
-    "fade_opacity": 0.96,
-    "vol": 0.12
+    "fade_height": 0.7,
+    "fade_opacity": 1.0,
+    "vol": 0.09999999999999998
   },
   "videos_config": {
-    "video_path": "/Users/hariomsingh/Desktop/mycliper/downloaded_videos/Me at the zoo.mp4",
+    "video_path": "/Users/hariomsingh/Desktop/mycliper/downloaded_videos/Spiritual Karim is live 28 Apr 2025.mp4",
     "ratio_str": "9:16 (Shorts/Reels)",
     "ratio_val": "16:9",
     "scale": 1.0,
     "pos_x": 0.5,
-    "pos_y": 0.5,
+    "pos_y": 0.0,
     "pad_top": 0.0,
     "pad_bottom": 5.5,
     "bottom_fade": true,
-    "fade_height": 0.5,
-    "fade_opacity": 0.93,
-    "vol": 0.12
+    "fade_height": 0.42,
+    "fade_opacity": 0.92,
+    "vol": 0.09999999999999998
   },
   "audio": {
     "enabled": true,
-    "path": ""
+    "path": "",
+    "video_volume": 1.5
   },
   "subtitles": {
     "enabled": true,
-    "path": "",
+    "path": "/Users/hariomsingh/Desktop/mycliper/downloaded_videos/Spiritual Karim is live 28 Apr 2025.hi.srt",
     "style": "⚪ Classic Crisp White (Bold Black Border)",
     "font": "Kohinoor Devanagari",
-    "size": "20pt (Standard)",
+    "size": "14pt (Tiny)",
     "border": "No Border (Clean Text)",
-    "position": "Caption: Inside Black Bottom Bar"
+    "position": "⚙️ Custom Position",
+    "pos_y": 0.03,
+    "overflow": true
   },
   "music": {
     "enabled": true,
-    "path": "",
-    "volume": 0.18
+    "path": "/Users/hariomsingh/Downloads/6hr+bgcalmstudy.mp3",
+    "volume": 0.09999999999999998
   },
-  "skip_existing": true
+  "skip_existing": false,
+  "youtube_config": {
+    "enabled": false,
+    "auto_captions": true,
+    "noise_removal": true,
+    "noise_intensity": "Low",
+    "auto_delete_after_days": 2.0
+  }
 }

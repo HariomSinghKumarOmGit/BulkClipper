@@ -37,10 +37,17 @@ from process_full import (
     probe_video, probe_audio, compute_crop_filter, run_pipeline, get_available_encoders,
     generate_3segment_preview, combine_video_audio, CAPTION_STYLES
 )
-from sub_utils import parse_timestamp_entries, sanitize_filename, auto_fix_timestamp_text
+from sub_utils import (
+    parse_timestamp_entries, sanitize_filename, auto_fix_timestamp_text,
+    reflow_subtitles, generate_speech_timed_srt, load_any_subtitles,
+    find_matching_subtitles, clean_and_deoverlap_subtitles
+)
 from clip_tester import extract_thumbnail
 from config_manager import load_saved_config, save_saved_config
-from yt_downloader import YouTubeDownloader, DOWNLOADS_DIR
+from yt_downloader import (
+    YouTubeDownloader, DOWNLOADS_DIR, AUDIO_DOWNLOADS_DIR,
+    cleanup_expired_youtube_videos, DEFAULT_EXPIRY_DAYS
+)
 
 # Set appearance and theme
 ctk.set_appearance_mode("Dark")
@@ -147,6 +154,33 @@ class StudioClipperApp(ctk.CTk):
         self.videos_config = saved_cfg["videos_config"]
         self.active_mode = saved_cfg.get("active_mode", "shorts")
 
+        # YouTube Integration State (Revealed inside Shorts & Videos when toggle is ON)
+        yt_cfg = saved_cfg.get("youtube_config", {})
+        self.yt_enabled: bool = yt_cfg.get("enabled", False)
+        self.yt_auto_captions_var = ctk.BooleanVar(value=yt_cfg.get("auto_captions", True))
+        self.yt_noise_removal_var = ctk.BooleanVar(value=yt_cfg.get("noise_removal", True))
+        self.yt_noise_intensity: str = yt_cfg.get("noise_intensity", "Medium")
+        self.yt_auto_delete_days: float = float(yt_cfg.get("auto_delete_after_days", DEFAULT_EXPIRY_DAYS))
+
+        self.yt_downloader: Optional[YouTubeDownloader] = None
+        self.is_yt_downloading: bool = False
+        self.is_yt_sub_downloading: bool = False
+        self.is_yt_audio_downloading: bool = False
+        self.yt_msg_queue: queue.Queue = queue.Queue()
+        self.yt_audio_player_proc: Optional[subprocess.Popen] = None
+        self.yt_is_playing_audio: bool = False
+
+        # Start background cleanup of YouTube loaded videos older than 2 days on launch
+        def _startup_yt_cleanup():
+            try:
+                cleanup_expired_youtube_videos(max_age_days=self.yt_auto_delete_days, verbose=False)
+            except Exception:
+                pass
+        threading.Thread(target=_startup_yt_cleanup, daemon=True).start()
+
+        # Schedule recurring cleanup check (every 1 hour)
+        self.after(3600000, self._periodic_yt_cleanup)
+
         # Active mode profile (Sections 1 & 2)
         active_cfg = self.shorts_config if self.active_mode == "shorts" else self.videos_config
         self.current_ratio = active_cfg["ratio_val"]
@@ -159,10 +193,11 @@ class StudioClipperApp(ctk.CTk):
         self.fade_height = active_cfg.get("fade_height", 0.38)
         self.fade_opacity = active_cfg.get("fade_opacity", 0.92)
 
-        # Audio track pairing configuration (Sections 1: High-Quality Audio Pairing)
+        # Audio track pairing & Main Video Volume configuration (Section 1)
         audio_cfg = saved_cfg.get("audio", {})
         self.saved_audio_enabled = audio_cfg.get("enabled", True)
         self.saved_audio_path = audio_cfg.get("path", "")
+        self.current_video_vol = float(audio_cfg.get("video_volume", 1.0))
 
         # Universal Sections 3 (Subtitles) & 4 (Music & Volume)
         sub_cfg = saved_cfg.get("subtitles", {})
@@ -171,6 +206,10 @@ class StudioClipperApp(ctk.CTk):
         self.saved_font_size = sub_cfg.get("size", "Medium (22pt)")
         self.saved_caption_border = sub_cfg.get("border", "Auto (Preset Default)")
         self.saved_caption_pos = sub_cfg.get("position", "Caption: On Video Fade (Above Padding)")
+        default_pos_y = 0.06 if "Inside Black" in self.saved_caption_pos else 0.15
+        self.sub_pos_y = float(sub_cfg.get("pos_y", default_pos_y))
+        self.saved_caption_overflow = bool(sub_cfg.get("overflow", False))
+        self.caption_overflow_var = ctk.BooleanVar(value=self.saved_caption_overflow)
         self.saved_sub_enabled = sub_cfg.get("enabled", True)
         self.saved_srt_path = sub_cfg.get("path", "")
 
@@ -219,15 +258,15 @@ class StudioClipperApp(ctk.CTk):
             self.music_entry.insert(0, self.saved_music_path)
 
     def _build_ui(self):
-        # Configure layout (2 columns)
-        self.grid_columnconfigure(0, weight=1)
+        # Configure layout (2 columns: left controls column minsize=460, right preview column expand)
+        self.grid_columnconfigure(0, weight=0, minsize=460)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
         # ==============================================================
         # LEFT COLUMN: CONTROLS & FILE PICKERS (Scrollable to Bottom)
         # ==============================================================
-        self.left_frame = ctk.CTkScrollableFrame(self, corner_radius=10)
+        self.left_frame = ctk.CTkScrollableFrame(self, width=460, corner_radius=10)
         self.left_frame.grid(row=0, column=0, padx=(16, 8), pady=16, sticky="nsew")
 
         # Ensure smooth mousewheel/trackpad scrolling throughout left_frame even over sliders & controls
@@ -245,27 +284,27 @@ class StudioClipperApp(ctk.CTk):
         self.left_frame._check_if_valid_scroll = _custom_check_scroll
 
         # -------------------------------------------------------------
-        # SHORTS vs VIDEOS MODE SWITCHER CARD + 1-CLICK FOLDER AUTO-RUN
+        # SHORTS vs VIDEOS MODE SWITCHER CARD + 1-CLICK & YOUTUBE TOGGLE
         # -------------------------------------------------------------
         mode_card = ctk.CTkFrame(
             self.left_frame,
             fg_color="#182030",
             border_width=1,
             border_color="#334155",
-            corner_radius=22
+            corner_radius=18
         )
-        mode_card.pack(fill="x", pady=(0, 14))
+        mode_card.pack(fill="x", pady=(0, 14), padx=2)
 
-        pill_box = ctk.CTkFrame(mode_card, fg_color="#0f172a", corner_radius=18)
-        pill_box.pack(side="left", padx=6, pady=4)
+        pill_box = ctk.CTkFrame(mode_card, fg_color="#0f172a", corner_radius=16)
+        pill_box.pack(side="left", padx=(6, 4), pady=4)
 
         self.btn_mode_shorts = ctk.CTkButton(
             pill_box,
             text="Shorts",
-            width=92,
-            height=32,
-            corner_radius=16,
-            font=ctk.CTkFont(size=13, weight="bold"),
+            width=82,
+            height=30,
+            corner_radius=14,
+            font=ctk.CTkFont(size=12, weight="bold"),
             fg_color="#cbd5e1",
             text_color="#0f172a",
             hover_color="#e2e8f0",
@@ -276,10 +315,10 @@ class StudioClipperApp(ctk.CTk):
         self.btn_mode_videos = ctk.CTkButton(
             pill_box,
             text="Videos",
-            width=92,
-            height=32,
-            corner_radius=16,
-            font=ctk.CTkFont(size=13, weight="bold"),
+            width=82,
+            height=30,
+            corner_radius=14,
+            font=ctk.CTkFont(size=12, weight="bold"),
             fg_color="transparent",
             text_color="#94a3b8",
             hover_color="#242c3d",
@@ -287,152 +326,198 @@ class StudioClipperApp(ctk.CTk):
         )
         self.btn_mode_videos.pack(side="left", padx=2, pady=2)
 
+        # 1-Click Folder Button
         self.btn_1click_folder = ctk.CTkButton(
             mode_card,
             text="⚡ 1-Click",
-            width=86,
-            height=32,
-            corner_radius=16,
+            width=80,
+            height=30,
+            corner_radius=15,
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color="#2563eb",
             text_color="#ffffff",
             hover_color="#1d4ed8",
             command=self._choose_folder_and_run
         )
-        self.btn_1click_folder.pack(side="right", padx=(0, 8), pady=4)
+        self.btn_1click_folder.pack(side="left", padx=(4, 4), pady=4)
         self.btn_auto_badge = self.btn_1click_folder
 
-        # 1. Source Video Selection (YouTube Link or Local Video File)
-        self._create_section_label(self.left_frame, "1. Source Video (YouTube Download or Local File)")
-
-        # --- A. YouTube Video Downloader Card ---
-        yt_card = ctk.CTkFrame(self.left_frame, fg_color="#181c27", corner_radius=10, border_width=1, border_color="#2c3344")
-        yt_card.pack(fill="x", pady=(0, 10), padx=2)
-
-        yt_header_box = ctk.CTkFrame(yt_card, fg_color="transparent")
-        yt_header_box.pack(fill="x", padx=10, pady=(8, 4))
-
-        yt_icon_title = ctk.CTkLabel(
-            yt_header_box,
-            text="🔴 Paste YouTube Link (Highest Quality Video+Audio Merged)",
+        # YouTube ON/OFF Toggle Button (OFF by default, prominent red border)
+        self.btn_youtube_toggle = ctk.CTkButton(
+            mode_card,
+            text="▶ YouTube ON" if self.yt_enabled else "▶ YouTube OFF",
+            width=114,
+            height=30,
+            corner_radius=15,
             font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#f8fafc"
+            fg_color="#dc2626" if self.yt_enabled else "#1e293b",
+            text_color="#ffffff" if self.yt_enabled else "#f87171",
+            hover_color="#b91c1c" if self.yt_enabled else "#334155",
+            border_width=1,
+            border_color="#ef4444" if self.yt_enabled else "#dc2626",
+            command=self._toggle_youtube_mode
         )
-        yt_icon_title.pack(side="left")
+        self.btn_youtube_toggle.pack(side="left", padx=(4, 6), pady=4)
 
-        self.btn_open_downloads = ctk.CTkButton(
-            yt_header_box,
-            text="📂 Downloads",
-            width=95,
-            height=22,
-            font=ctk.CTkFont(size=11),
-            fg_color="#1e293b",
-            hover_color="#334155",
-            command=self._open_downloads_folder
-        )
-        self.btn_open_downloads.pack(side="right")
+        # Standard Clipper Container (Holds Sections 1 to 5 for Shorts & Videos)
+        self.clipper_container = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        self.clipper_container.pack(fill="x", expand=True)
 
-        yt_input_box = ctk.CTkFrame(yt_card, fg_color="transparent")
-        yt_input_box.pack(fill="x", padx=10, pady=(0, 8))
+        # Build YouTube Tools Card inside clipper_container (revealed when YouTube is ON)
+        self._build_yt_tools_card()
 
-        self.yt_url_entry = ctk.CTkEntry(
-            yt_input_box,
-            placeholder_text="Paste YouTube video or Shorts link here (e.g. https://youtu.be/...)..."
-        )
-        self.yt_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self.yt_url_entry.bind("<Return>", lambda e: self._start_yt_download())
-
-        self.btn_yt_paste = ctk.CTkButton(
-            yt_input_box,
-            text="📋 Paste",
-            width=65,
-            fg_color="#334155",
-            hover_color="#475569",
-            command=self._paste_yt_url
-        )
-        self.btn_yt_paste.pack(side="left", padx=(0, 6))
-
-        self.btn_yt_download = ctk.CTkButton(
-            yt_input_box,
-            text="⬇️ Download",
-            width=100,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="#dc2626",
-            hover_color="#b91c1c",
-            command=self._start_yt_download
-        )
-        self.btn_yt_download.pack(side="right")
-
-        # Progress / Status frame
-        self.yt_progress_frame = ctk.CTkFrame(yt_card, fg_color="#111520", corner_radius=6)
-        self.yt_progress_frame.pack(fill="x", padx=10, pady=(0, 8))
-
-        self.yt_title_label = ctk.CTkLabel(
-            self.yt_progress_frame,
-            text="",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#e2e8f0",
-            anchor="w"
-        )
-        self.yt_title_label.pack(fill="x", padx=8, pady=(4, 2))
-
-        self.yt_progress_bar = ctk.CTkProgressBar(self.yt_progress_frame, height=8, corner_radius=4)
-        self.yt_progress_bar.set(0.0)
-        self.yt_progress_bar.pack(fill="x", padx=8, pady=(2, 4))
-
-        yt_status_row = ctk.CTkFrame(self.yt_progress_frame, fg_color="transparent")
-        yt_status_row.pack(fill="x", padx=8, pady=(0, 4))
-
-        self.yt_status_label = ctk.CTkLabel(
-            yt_status_row,
-            text="Ready to download high-res video (auto-loads into Clipper upon finish)",
-            font=ctk.CTkFont(size=11),
-            text_color="#94a3b8",
-            anchor="w"
-        )
-        self.yt_status_label.pack(side="left", fill="x", expand=True)
-
-        self.btn_yt_cancel = ctk.CTkButton(
-            yt_status_row,
-            text="✕ Cancel",
-            width=65,
-            height=20,
-            font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color="#475569",
-            hover_color="#64748b",
-            state="disabled",
-            command=self._cancel_yt_download
-        )
-        self.btn_yt_cancel.pack(side="right")
-
-        # --- B. Local Video Selection ---
-        local_label = ctk.CTkLabel(
-            self.left_frame,
-            text="📁 Or Select Local Video File (.mp4, .mov, .mkv):",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#94a3b8"
-        )
-        local_label.pack(anchor="w", pady=(0, 4))
+        # 1. Source Video Selection
+        self.sec1_label = self._create_section_label(self.clipper_container, "1. Source Video (.mp4, .mov, .mkv)")
+        if self.yt_enabled:
+            self.yt_tools_card.pack(fill="x", pady=(0, 14), before=self.sec1_label)
         
-        vid_box = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        vid_box = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         vid_box.pack(fill="x", pady=(0, 6))
 
-        self.video_entry = ctk.CTkEntry(vid_box, placeholder_text="Select a video from your Mac...")
-        self.video_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.video_entry = ctk.CTkEntry(vid_box, placeholder_text="Select a video file or paste path...")
+        self.video_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.video_entry.bind("<Return>", lambda e: self._on_video_entry_submitted())
+        self.video_entry.bind("<FocusOut>", lambda e: self._on_video_entry_submitted())
 
-        self.btn_browse_vid = ctk.CTkButton(vid_box, text="📁 Choose File", width=110, command=self._browse_video)
+        self.btn_paste_vid = ctk.CTkButton(
+            vid_box,
+            text="📋 Paste",
+            width=64,
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self._paste_and_load_video
+        )
+        self.btn_paste_vid.pack(side="left", padx=(0, 6))
+
+        self.btn_browse_vid = ctk.CTkButton(vid_box, text="📁 Choose File", width=105, command=self._browse_video)
         self.btn_browse_vid.pack(side="right")
 
         self.meta_label = ctk.CTkLabel(
-            self.left_frame,
+            self.clipper_container,
             text="No video loaded yet",
             text_color="gray",
             font=ctk.CTkFont(size=12)
         )
         self.meta_label.pack(anchor="w", pady=(0, 6))
 
+        # --- Main Video Sound / Volume Boost (Section 1) ---
+        self.vid_vol_frame = ctk.CTkFrame(self.clipper_container, fg_color="#181c27", corner_radius=8)
+        self.vid_vol_frame.pack(fill="x", pady=(0, 10), padx=2)
+
+        vid_vol_header = ctk.CTkFrame(self.vid_vol_frame, fg_color="transparent")
+        vid_vol_header.pack(fill="x", padx=10, pady=(8, 4))
+
+        vol_pct = int(round(self.current_video_vol * 100))
+        if self.current_video_vol == 0:
+            vol_text = "🔇 Main Video Sound: Muted (0%)"
+        elif abs(self.current_video_vol - 1.0) < 0.01:
+            vol_text = "🔊 Main Video Sound: 100% (Normal)"
+        elif self.current_video_vol > 1.0:
+            vol_text = f"🔊 Main Video Sound: {vol_pct}% ({self.current_video_vol:.2f}x Boost 🚀)"
+        else:
+            vol_text = f"🔉 Main Video Sound: {vol_pct}% ({self.current_video_vol:.2f}x)"
+
+        self.video_vol_label_var = ctk.StringVar(value=vol_text)
+        self.video_vol_label = ctk.CTkLabel(
+            vid_vol_header,
+            textvariable=self.video_vol_label_var,
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        self.video_vol_label.pack(side="left")
+
+        # Preset buttons (Reset 100%, 150%, 200%)
+        btn_preset_box = ctk.CTkFrame(vid_vol_header, fg_color="transparent")
+        btn_preset_box.pack(side="right")
+
+        self.btn_vvol_200 = ctk.CTkButton(
+            btn_preset_box,
+            text="200%",
+            width=46,
+            height=22,
+            font=ctk.CTkFont(size=11),
+            fg_color="#2b3245",
+            hover_color="#3b445c",
+            command=lambda: self._set_video_vol(2.0)
+        )
+        self.btn_vvol_200.pack(side="right", padx=(4, 0))
+
+        self.btn_vvol_150 = ctk.CTkButton(
+            btn_preset_box,
+            text="150%",
+            width=46,
+            height=22,
+            font=ctk.CTkFont(size=11),
+            fg_color="#2b3245",
+            hover_color="#3b445c",
+            command=lambda: self._set_video_vol(1.5)
+        )
+        self.btn_vvol_150.pack(side="right", padx=(4, 0))
+
+        self.btn_reset_vvol = ctk.CTkButton(
+            btn_preset_box,
+            text="Reset 100%",
+            width=70,
+            height=22,
+            font=ctk.CTkFont(size=11),
+            fg_color="#374151",
+            hover_color="#4b5563",
+            command=lambda: self._set_video_vol(1.0)
+        )
+        self.btn_reset_vvol.pack(side="right")
+
+        # Slider row with - / + nudge buttons
+        vid_vol_ctrl = ctk.CTkFrame(self.vid_vol_frame, fg_color="transparent")
+        vid_vol_ctrl.pack(fill="x", padx=10, pady=(2, 6))
+
+        self.btn_vvol_minus = ctk.CTkButton(
+            vid_vol_ctrl,
+            text="-",
+            width=32,
+            height=28,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            fg_color="#2b3245",
+            hover_color="#3b445c",
+            corner_radius=6
+        )
+        self.btn_vvol_minus.pack(side="left", padx=(0, 6))
+
+        self.video_vol_slider = ctk.CTkSlider(
+            vid_vol_ctrl,
+            from_=0.0,
+            to=3.0,
+            number_of_steps=60,
+            command=self._on_video_vol_slider_changed
+        )
+        self.video_vol_slider.set(self.current_video_vol)
+        self.video_vol_slider.pack(side="left", fill="x", expand=True)
+
+        self.btn_vvol_plus = ctk.CTkButton(
+            vid_vol_ctrl,
+            text="+",
+            width=32,
+            height=28,
+            font=ctk.CTkFont(size=16, weight="bold"),
+            fg_color="#2b3245",
+            hover_color="#3b445c",
+            corner_radius=6
+        )
+        self.btn_vvol_plus.pack(side="right", padx=(6, 0))
+
+        self._attach_button_repeat(self.btn_vvol_minus, self._video_vol_step_minus)
+        self._attach_button_repeat(self.btn_vvol_plus, self._video_vol_step_plus)
+        self._disable_slider_scroll(self.video_vol_slider, self.left_frame)
+
+        # Helper hint
+        self.video_vol_hint = ctk.CTkLabel(
+            self.vid_vol_frame,
+            text="💡 Adjust to boost quiet speech/dialogue (e.g. 150% = 1.5x louder, 200% = 2x boost)",
+            font=ctk.CTkFont(size=11),
+            text_color="#94a3b8"
+        )
+        self.video_vol_hint.pack(anchor="w", padx=10, pady=(0, 8))
+
         # Audio Pairing controls (for videos downloaded without high-quality audio)
-        audio_sub_frame = ctk.CTkFrame(self.left_frame, fg_color="#181c27", corner_radius=8)
+        audio_sub_frame = ctk.CTkFrame(self.clipper_container, fg_color="#181c27", corner_radius=8)
         audio_sub_frame.pack(fill="x", pady=(0, 14), padx=2)
 
         audio_header_box = ctk.CTkFrame(audio_sub_frame, fg_color="transparent")
@@ -489,10 +574,10 @@ class StudioClipperApp(ctk.CTk):
         self.btn_quick_combine.pack(side="right")
 
         # 2. Aspect Ratio & Crop Positioning
-        self.section_2_label = self._create_section_label(self.left_frame, "2. Aspect Ratio & Crop Framing (📱 Shorts)")
+        self.section_2_label = self._create_section_label(self.clipper_container, "2. Aspect Ratio & Crop Framing (📱 Shorts)")
 
         self.ratio_segmented = ctk.CTkSegmentedButton(
-            self.left_frame,
+            self.clipper_container,
             values=["9:16 (Shorts/Reels)", "1:1 (Square)", "4:5 (Portrait)", "16:9 (Original)"],
             command=self._on_ratio_changed
         )
@@ -500,7 +585,7 @@ class StudioClipperApp(ctk.CTk):
         self.ratio_segmented.pack(fill="x", pady=(0, 6))
 
         self.ratio_info_label = ctk.CTkLabel(
-            self.left_frame,
+            self.clipper_container,
             text="💡 Selected ratio & framing apply to Shorts (≤3m). Clips >3m automatically use Videos settings.",
             font=ctk.CTkFont(size=11),
             text_color="#9ca3af",
@@ -510,7 +595,7 @@ class StudioClipperApp(ctk.CTk):
         self.ratio_info_label.pack(anchor="w", pady=(0, 10))
 
         # --- A. Scale / Zoom Framing ---
-        scale_header_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        scale_header_frame = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         scale_header_frame.pack(fill="x", pady=(0, 2))
 
         self.scale_label_var = ctk.StringVar(value="Scale / Zoom: 1.00x (Standard Fill)")
@@ -529,7 +614,7 @@ class StudioClipperApp(ctk.CTk):
         )
         self.btn_reset_scale.pack(side="right")
 
-        scale_ctrl_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        scale_ctrl_frame = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         scale_ctrl_frame.pack(fill="x", pady=(0, 10))
 
         self.btn_scale_minus = ctk.CTkButton(
@@ -571,7 +656,7 @@ class StudioClipperApp(ctk.CTk):
         self._disable_slider_scroll(self.scale_slider, self.left_frame)
 
         # --- B. Horizontal Framing (X) ---
-        pos_header_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pos_header_frame = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pos_header_frame.pack(fill="x", pady=(0, 2))
 
         self.pos_label_var = ctk.StringVar(value="Horizontal Framing (X): Center (50%)")
@@ -590,7 +675,7 @@ class StudioClipperApp(ctk.CTk):
         )
         self.btn_center_pos_x.pack(side="right")
 
-        pos_ctrl_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pos_ctrl_frame = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pos_ctrl_frame.pack(fill="x", pady=(0, 10))
 
         self.btn_pos_minus = ctk.CTkButton(
@@ -632,7 +717,7 @@ class StudioClipperApp(ctk.CTk):
         self._disable_slider_scroll(self.pos_slider, self.left_frame)
 
         # --- C. Vertical Framing (Y) ---
-        pos_y_header_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pos_y_header_frame = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pos_y_header_frame.pack(fill="x", pady=(0, 2))
 
         self.pos_y_label_var = ctk.StringVar(value="Vertical Framing (Y): Center (50%)")
@@ -651,7 +736,7 @@ class StudioClipperApp(ctk.CTk):
         )
         self.btn_center_pos_y.pack(side="right")
 
-        pos_y_ctrl_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pos_y_ctrl_frame = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pos_y_ctrl_frame.pack(fill="x", pady=(0, 10))
 
         self.btn_pos_y_minus = ctk.CTkButton(
@@ -693,7 +778,7 @@ class StudioClipperApp(ctk.CTk):
         self._disable_slider_scroll(self.pos_y_slider, self.left_frame)
 
         # --- D. Frame Padding (Shift Clip Up / Letterbox) ---
-        pad_header_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_header_frame = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pad_header_frame.pack(fill="x", pady=(0, 2))
 
         ctk.CTkLabel(
@@ -703,7 +788,7 @@ class StudioClipperApp(ctk.CTk):
         ).pack(side="left")
 
         # Quick Preset Buttons:
-        pad_preset_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_preset_frame = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pad_preset_frame.pack(fill="x", pady=(2, 8))
 
         self.btn_preset_shifted = ctk.CTkButton(
@@ -740,12 +825,12 @@ class StudioClipperApp(ctk.CTk):
         self.btn_preset_zero.pack(side="left", padx=(4, 0), expand=True, fill="x")
 
         # Top Padding Slider with - / + buttons
-        pad_top_subhead = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_top_subhead = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pad_top_subhead.pack(fill="x", pady=(0, 2))
         self.pad_top_label_var = ctk.StringVar(value="Top Padding: 0%")
         ctk.CTkLabel(pad_top_subhead, textvariable=self.pad_top_label_var, font=ctk.CTkFont(size=11)).pack(side="left")
 
-        pad_top_ctrl = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_top_ctrl = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pad_top_ctrl.pack(fill="x", pady=(0, 8))
 
         self.btn_pad_top_minus = ctk.CTkButton(pad_top_ctrl, text="-", width=32, height=26, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
@@ -763,12 +848,12 @@ class StudioClipperApp(ctk.CTk):
         self._disable_slider_scroll(self.pad_top_slider, self.left_frame)
 
         # Bottom Padding Slider with - / + buttons
-        pad_bottom_subhead = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_bottom_subhead = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pad_bottom_subhead.pack(fill="x", pady=(0, 2))
         self.pad_bottom_label_var = ctk.StringVar(value="Bottom Padding: 0%")
         ctk.CTkLabel(pad_bottom_subhead, textvariable=self.pad_bottom_label_var, font=ctk.CTkFont(size=11)).pack(side="left")
 
-        pad_bottom_ctrl = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        pad_bottom_ctrl = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         pad_bottom_ctrl.pack(fill="x", pady=(0, 10))
 
         self.btn_pad_bottom_minus = ctk.CTkButton(pad_bottom_ctrl, text="-", width=32, height=26, font=ctk.CTkFont(size=14, weight="bold"), fg_color="#2b3245", hover_color="#3b445c", corner_radius=6)
@@ -786,7 +871,7 @@ class StudioClipperApp(ctk.CTk):
         self._disable_slider_scroll(self.pad_bottom_slider, self.left_frame)
 
         # --- E. Bottom Black Fade (Caption Contrast) Switch & Controls ---
-        fade_box = ctk.CTkFrame(self.left_frame, fg_color="#182030", border_width=1, border_color="#374151", corner_radius=8)
+        fade_box = ctk.CTkFrame(self.clipper_container, fg_color="#182030", border_width=1, border_color="#374151", corner_radius=8)
         fade_box.pack(fill="x", pady=(0, 14))
 
         self.fade_switch = ctk.CTkSwitch(
@@ -863,18 +948,18 @@ class StudioClipperApp(ctk.CTk):
         ctk.CTkButton(fade_presets_row, text="Deep (52%)", height=24, font=ctk.CTkFont(size=10), fg_color="#2b3245", hover_color="#3b445c", command=lambda: self._set_fade_preset(0.52, 1.0)).pack(side="left", expand=True, fill="x")
 
         # 3. Subtitles & Captions / Lyrics
-        self._create_section_label(self.left_frame, "3. Subtitles & Lyrics (.srt, .ass, .lrc)")
+        self._create_section_label(self.clipper_container, "3. Subtitles & Lyrics (.srt, .ass, .lrc)")
         
         self.sub_switch_var = ctk.BooleanVar(value=self.saved_sub_enabled)
         self.sub_switch = ctk.CTkSwitch(
-            self.left_frame,
+            self.clipper_container,
             text="Burn Subtitles / Lyrics into Video",
             variable=self.sub_switch_var,
             command=lambda: (self._update_cli_display(), self._save_persistent_config())
         )
         self.sub_switch.pack(anchor="w", pady=(0, 8))
 
-        sub_box = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        sub_box = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         sub_box.pack(fill="x", pady=(0, 6))
 
         self.srt_entry = ctk.CTkEntry(sub_box, placeholder_text="Select subtitle or lyrics (.srt, .ass, .lrc)...")
@@ -884,11 +969,11 @@ class StudioClipperApp(ctk.CTk):
         self.btn_browse_srt.pack(side="right")
 
         # Caption Style Menu (Presets from marketplace: Soothe White Light, Viral Yellow, etc.)
-        ctk.CTkLabel(self.left_frame, text="Caption Style Preset:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#cbd5e1").pack(anchor="w", pady=(4, 2))
+        ctk.CTkLabel(self.clipper_container, text="Caption Style Preset:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#cbd5e1").pack(anchor="w", pady=(4, 2))
 
         caption_styles_list = list(CAPTION_STYLES.keys())
         self.caption_style_menu = ctk.CTkOptionMenu(
-            self.left_frame,
+            self.clipper_container,
             values=caption_styles_list,
             command=self._on_caption_style_changed
         )
@@ -900,7 +985,7 @@ class StudioClipperApp(ctk.CTk):
         self.caption_style_menu.pack(fill="x", pady=(0, 8))
 
         # Font Family & Border Options Row
-        font_border_row = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        font_border_row = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         font_border_row.pack(fill="x", pady=(0, 8))
 
         # Font column
@@ -933,17 +1018,14 @@ class StudioClipperApp(ctk.CTk):
             self.border_menu.set("Auto (Preset Default)")
         self.border_menu.pack(fill="x")
 
-        # Caption Size (with [-] and [+] nudge buttons) & Vertical Placement Row
-        size_pos_row = ctk.CTkFrame(self.left_frame, fg_color="transparent")
-        size_pos_row.pack(fill="x", pady=(0, 14))
+        # Caption Size (with [-] and [+] nudge buttons)
+        size_row = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
+        size_row.pack(fill="x", pady=(0, 8))
 
-        # Size Column
-        size_col = ctk.CTkFrame(size_pos_row, fg_color="transparent")
-        size_col.pack(side="left", fill="x", expand=False, padx=(0, 8))
-        ctk.CTkLabel(size_col, text="Caption Size:", font=ctk.CTkFont(size=11, weight="bold"), text_color="#cbd5e1").pack(anchor="w", pady=(0, 2))
+        ctk.CTkLabel(size_row, text="Caption Size:", font=ctk.CTkFont(size=11, weight="bold"), text_color="#cbd5e1").pack(side="left", padx=(0, 10))
 
-        size_ctrl_box = ctk.CTkFrame(size_col, fg_color="transparent")
-        size_ctrl_box.pack(fill="x")
+        size_ctrl_box = ctk.CTkFrame(size_row, fg_color="transparent")
+        size_ctrl_box.pack(side="right")
 
         self.btn_size_minus = ctk.CTkButton(
             size_ctrl_box,
@@ -960,10 +1042,9 @@ class StudioClipperApp(ctk.CTk):
         self.size_menu = ctk.CTkOptionMenu(
             size_ctrl_box,
             values=FONT_SIZE_OPTIONS,
-            width=132,
+            width=140,
             command=lambda _: (self._render_visual_crop(), self._update_cli_display(), self._save_persistent_config())
         )
-        # Restore saved font size matching FONT_SIZE_OPTIONS
         init_size = self.saved_font_size if hasattr(self, "saved_font_size") else "Medium (22pt)"
         matched_init = False
         for opt in FONT_SIZE_OPTIONS:
@@ -994,47 +1075,243 @@ class StudioClipperApp(ctk.CTk):
         self._attach_button_repeat(self.btn_size_minus, lambda: self._step_font_size(-2))
         self._attach_button_repeat(self.btn_size_plus, lambda: self._step_font_size(2))
 
-        # Position Column
-        pos_col = ctk.CTkFrame(size_pos_row, fg_color="transparent")
-        pos_col.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(pos_col, text="Vertical Placement:", font=ctk.CTkFont(size=11, weight="bold"), text_color="#cbd5e1").pack(anchor="w", pady=(0, 2))
+        # Subtitle Vertical Position (Y) Card
+        sub_pos_card = ctk.CTkFrame(self.clipper_container, fg_color="#181c27", corner_radius=8)
+        sub_pos_card.pack(fill="x", pady=(0, 14), padx=2)
 
-        self.caption_pos_menu = ctk.CTkOptionMenu(
-            pos_col,
-            values=["Caption: On Video Fade (Above Padding)", "Caption: Inside Black Bottom Bar"],
-            command=lambda _: (self._render_visual_crop(), self._update_cli_display(), self._save_persistent_config())
+        sub_pos_header = ctk.CTkFrame(sub_pos_card, fg_color="transparent")
+        sub_pos_header.pack(fill="x", padx=10, pady=(8, 4))
+
+        pct_val = int(round(self.sub_pos_y * 100))
+        self.sub_pos_label_var = ctk.StringVar(value=f"Vertical Position (Y): {pct_val}%")
+        ctk.CTkLabel(
+            sub_pos_header,
+            textvariable=self.sub_pos_label_var,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#cbd5e1"
+        ).pack(side="left")
+
+        SUB_POS_PRESETS = [
+            "✨ Above Padding (15%)",
+            "🖤 Inside Bottom Bar (6%)",
+            "🎯 Screen Center (50%)",
+            "⬆️ Upper Third (75%)",
+            "🔝 Top Edge (85%)",
+            "⚙️ Custom Position"
+        ]
+        self.sub_pos_menu = ctk.CTkOptionMenu(
+            sub_pos_header,
+            values=SUB_POS_PRESETS,
+            width=175,
+            command=self._on_sub_pos_preset_selected
         )
-        self.caption_pos_menu.set(self.saved_caption_pos)
-        self.caption_pos_menu.pack(fill="x")
+        self.sub_pos_menu.pack(side="right")
+        self.caption_pos_menu = self.sub_pos_menu  # backward-compatibility alias
 
-        # 4. Background Music & Ducking
-        self._create_section_label(self.left_frame, "4. Background Music & Ducking (.mp3, .wav)")
+        # Slider row with [-] and [+] nudge buttons
+        sub_pos_ctrl_frame = ctk.CTkFrame(sub_pos_card, fg_color="transparent")
+        sub_pos_ctrl_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.btn_sub_pos_minus = ctk.CTkButton(
+            sub_pos_ctrl_frame,
+            text="-",
+            width=30,
+            height=28,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#2b3245",
+            hover_color="#3b445c",
+            corner_radius=6
+        )
+        self.btn_sub_pos_minus.pack(side="left", padx=(0, 6))
+
+        self.sub_pos_slider = ctk.CTkSlider(
+            sub_pos_ctrl_frame,
+            from_=0.0,
+            to=0.90,
+            number_of_steps=90,
+            command=self._on_sub_pos_slider_changed
+        )
+        self.sub_pos_slider.set(self.sub_pos_y)
+        self.sub_pos_slider.pack(side="left", fill="x", expand=True)
+
+        self.btn_sub_pos_plus = ctk.CTkButton(
+            sub_pos_ctrl_frame,
+            text="+",
+            width=30,
+            height=28,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            fg_color="#2b3245",
+            hover_color="#3b445c",
+            corner_radius=6
+        )
+        self.btn_sub_pos_plus.pack(side="right", padx=(6, 0))
+
+        self._attach_button_repeat(self.btn_sub_pos_minus, self._step_sub_pos_minus)
+        self._attach_button_repeat(self.btn_sub_pos_plus, self._step_sub_pos_plus)
+        self._disable_slider_scroll(self.sub_pos_slider, self.left_frame)
+        self._sync_sub_pos_menu_preset(pct_val)
+
+        # Subtitle Text Flow / Layout Card (Word Wrap vs Overflow)
+        flow_card = ctk.CTkFrame(self.clipper_container, fg_color="#181c27", corner_radius=8)
+        flow_card.pack(fill="x", pady=(0, 14), padx=2)
+
+        flow_header = ctk.CTkFrame(flow_card, fg_color="transparent")
+        flow_header.pack(fill="x", padx=10, pady=(8, 4))
+
+        self.overflow_label_var = ctk.StringVar(
+            value="Caption Flow: ⋯ Overflow (Single Line)" if self.saved_caption_overflow else "Caption Flow: ⤹ Word Wrap (Multi-Line)"
+        )
+        ctk.CTkLabel(
+            flow_header,
+            textvariable=self.overflow_label_var,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#cbd5e1"
+        ).pack(side="left")
+
+        flow_ctrl_frame = ctk.CTkFrame(flow_card, fg_color="transparent")
+        flow_ctrl_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.caption_overflow_switch = ctk.CTkSwitch(
+            flow_ctrl_frame,
+            text="Overflow Mode",
+            variable=self.caption_overflow_var,
+            command=self._on_caption_overflow_toggle
+        )
+        self.caption_overflow_switch.pack(side="left")
+
+        flow_btn_box = ctk.CTkFrame(flow_ctrl_frame, fg_color="transparent")
+        flow_btn_box.pack(side="right")
+
+        self.btn_flow_wrap = ctk.CTkButton(
+            flow_btn_box,
+            text="⤹ Word Wrap",
+            width=90,
+            height=28,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#2563eb" if not self.saved_caption_overflow else "#2b3245",
+            hover_color="#1d4ed8" if not self.saved_caption_overflow else "#3b445c",
+            corner_radius=6,
+            command=lambda: self._set_caption_overflow(False)
+        )
+        self.btn_flow_wrap.pack(side="left", padx=(0, 6))
+
+        self.btn_flow_overflow = ctk.CTkButton(
+            flow_btn_box,
+            text="⋯ Overflow",
+            width=90,
+            height=28,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#2563eb" if self.saved_caption_overflow else "#2b3245",
+            hover_color="#1d4ed8" if self.saved_caption_overflow else "#3b445c",
+            corner_radius=6,
+            command=lambda: self._set_caption_overflow(True)
+        )
+        self.btn_flow_overflow.pack(side="left")
+
+        # 4. Background Music & Ducking (.mp3, .wav, .m4a)
+        self._create_section_label(self.clipper_container, "4. Background Music & Ducking (.mp3, .wav, .m4a)")
 
         self.music_switch_var = ctk.BooleanVar(value=self.saved_music_enabled)
         self.music_switch = ctk.CTkSwitch(
-            self.left_frame,
+            self.clipper_container,
             text="Mix Background Music Track",
             variable=self.music_switch_var,
             command=lambda: (self._update_cli_display(), self._save_persistent_config())
         )
         self.music_switch.pack(anchor="w", pady=(0, 8))
 
-        music_box = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        # Main Core Action: Local File Selection
+        music_box = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         music_box.pack(fill="x", pady=(0, 6))
 
-        self.music_entry = ctk.CTkEntry(music_box, placeholder_text="Select background music file...")
+        self.music_entry = ctk.CTkEntry(music_box, placeholder_text="Select background music file (.mp3, .wav, .m4a)...")
         self.music_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
-        self.btn_browse_music = ctk.CTkButton(music_box, text="📁 Choose Music", width=110, command=self._browse_music)
+        self.btn_browse_music = ctk.CTkButton(
+            music_box,
+            text="📁 Choose Music",
+            width=110,
+            command=self._browse_music
+        )
         self.btn_browse_music.pack(side="right")
+        self.music_entry.bind("<Return>", self._on_music_entry_changed)
+        self.music_entry.bind("<FocusOut>", self._on_music_entry_changed)
+
+        # YouTube Music Downloader Card (Directly in Section 4)
+        yt_music_card = ctk.CTkFrame(self.clipper_container, fg_color="#181c27", corner_radius=8, border_width=1, border_color="#2c3344")
+        yt_music_card.pack(fill="x", pady=(4, 10))
+
+        yt_m_hdr = ctk.CTkLabel(
+            yt_music_card,
+            text="⬇️ Download Music from YouTube (Optional)",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#94a3b8"
+        )
+        yt_m_hdr.pack(anchor="w", padx=10, pady=(6, 4))
+
+        murl_row = ctk.CTkFrame(yt_music_card, fg_color="transparent")
+        murl_row.pack(fill="x", padx=10, pady=(0, 6))
+
+        self.yt_music_url_entry = ctk.CTkEntry(
+            murl_row,
+            placeholder_text="Paste YouTube Audio / Music URL...",
+            font=ctk.CTkFont(size=11)
+        )
+        self.yt_music_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        btn_paste_murl = ctk.CTkButton(
+            murl_row,
+            text="📋 Paste",
+            width=65,
+            height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self._paste_yt_music_url
+        )
+        btn_paste_murl.pack(side="left")
+
+        mact_row = ctk.CTkFrame(yt_music_card, fg_color="transparent")
+        mact_row.pack(fill="x", padx=10, pady=(0, 6))
+
+        self.btn_yt_music_dl = ctk.CTkButton(
+            mact_row,
+            text="🎵 Download Music",
+            height=26,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            command=self._start_yt_audio_download
+        )
+        self.btn_yt_music_dl.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        self.btn_yt_audio_preview = ctk.CTkButton(
+            mact_row,
+            text="▶ Play Preview",
+            width=100,
+            height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color="#10b981",
+            hover_color="#059669",
+            command=self._toggle_yt_audio_preview
+        )
+        self.btn_yt_audio_preview.pack(side="left")
+
+        self.yt_music_status_label = ctk.CTkLabel(
+            yt_music_card,
+            text="Downloaded music automatically loads into Section 4",
+            font=ctk.CTkFont(size=10),
+            text_color="#94a3b8"
+        )
+        self.yt_music_status_label.pack(anchor="w", padx=10, pady=(0, 6))
 
         # Ducking volume slider with - / + nudge buttons
         vol_pct = int(round(self.current_vol * 100))
         self.vol_label_var = ctk.StringVar(value=f"Background Volume: {vol_pct}% (Speech stays crisp)")
-        self.vol_label = ctk.CTkLabel(self.left_frame, textvariable=self.vol_label_var, font=ctk.CTkFont(size=12))
+        self.vol_label = ctk.CTkLabel(self.clipper_container, textvariable=self.vol_label_var, font=ctk.CTkFont(size=12))
         self.vol_label.pack(anchor="w", pady=(0, 2))
 
-        vol_ctrl_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        vol_ctrl_frame = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         vol_ctrl_frame.pack(fill="x", pady=(0, 14))
 
         self.btn_vol_minus = ctk.CTkButton(
@@ -1076,9 +1353,9 @@ class StudioClipperApp(ctk.CTk):
         self._disable_slider_scroll(self.vol_slider, self.left_frame)
 
         # 5. Preview & Render Actions
-        self._create_section_label(self.left_frame, "5. Render Controls")
+        self._create_section_label(self.clipper_container, "5. Render Controls")
 
-        offset_box = ctk.CTkFrame(self.left_frame, fg_color="transparent")
+        offset_box = ctk.CTkFrame(self.clipper_container, fg_color="transparent")
         offset_box.pack(fill="x", pady=(0, 10))
 
         ctk.CTkLabel(offset_box, text="Start Preview Offset (sec):", font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 10))
@@ -1087,7 +1364,7 @@ class StudioClipperApp(ctk.CTk):
         self.offset_entry.pack(side="left")
 
         self.btn_preview = ctk.CTkButton(
-            self.left_frame,
+            self.clipper_container,
             text="🎬 1-Min Single Preview (at Offset)",
             height=38,
             fg_color="#6366f1",
@@ -1098,7 +1375,7 @@ class StudioClipperApp(ctk.CTk):
         self.btn_preview.pack(fill="x", pady=(0, 6))
 
         self.btn_multi_preview = ctk.CTkButton(
-            self.left_frame,
+            self.clipper_container,
             text="🎞️ 3-Segment Preview (0%, 45%, 75% • 3 Min)",
             height=40,
             fg_color="#7c3aed",
@@ -1109,7 +1386,10 @@ class StudioClipperApp(ctk.CTk):
         self.btn_multi_preview.pack(fill="x", pady=(0, 10))
 
         # Bottom scroll clearance spacer (ensures full visibility of buttons when scrolling to bottom)
-        ctk.CTkFrame(self.left_frame, height=36, fg_color="transparent").pack(fill="x", pady=(0, 10))
+        ctk.CTkFrame(self.clipper_container, height=36, fg_color="transparent").pack(fill="x", pady=(0, 10))
+
+
+
 
         # ==============================================================
         # ==============================================================
@@ -1356,14 +1636,345 @@ class StudioClipperApp(ctk.CTk):
         return lbl
 
     # ==============================================================
-    # YOUTUBE HIGHEST QUALITY DOWNLOADER
+    # YOUTUBE INTEGRATION TOOLS (INLINE IN SHORTS & VIDEOS PANELS)
     # ==============================================================
+    def _build_yt_tools_card(self):
+        """Constructs the compact YouTube Tools Card inside self.clipper_container."""
+        self.yt_tools_card = ctk.CTkFrame(
+            self.clipper_container,
+            fg_color="#141824",
+            border_width=1,
+            border_color="#dc2626",
+            corner_radius=12
+        )
+        # Unpacked by default (revealed when YouTube toggle is ON)
+
+        # Header Title
+        hdr = ctk.CTkFrame(self.yt_tools_card, fg_color="transparent")
+        hdr.pack(fill="x", padx=12, pady=(10, 6))
+
+        lbl_yt_title = ctk.CTkLabel(
+            hdr,
+            text="🔴 YOUTUBE INTEGRATION TOOLS",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#f87171"
+        )
+        lbl_yt_title.pack(side="left")
+
+        self.yt_active_mode_lbl = ctk.CTkLabel(
+            hdr,
+            text="Active Target: " + ("📱 Shorts" if self.active_mode == "shorts" else "🎬 Videos"),
+            font=ctk.CTkFont(size=11),
+            text_color="#94a3b8"
+        )
+        self.yt_active_mode_lbl.pack(side="right")
+
+        # -----------------------------------------------------------------
+        # A. YOUTUBE VIDEO IMPORT
+        # -----------------------------------------------------------------
+        sec_a_lbl = ctk.CTkLabel(self.yt_tools_card, text="A. YOUTUBE VIDEO IMPORT", font=ctk.CTkFont(size=12, weight="bold"))
+        sec_a_lbl.pack(anchor="w", padx=12, pady=(4, 4))
+
+        url_row = ctk.CTkFrame(self.yt_tools_card, fg_color="transparent")
+        url_row.pack(fill="x", padx=12, pady=(0, 6))
+
+        self.yt_url_entry = ctk.CTkEntry(
+            url_row,
+            placeholder_text="Paste YouTube Video or Shorts URL...",
+            font=ctk.CTkFont(size=12)
+        )
+        self.yt_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        btn_paste_url = ctk.CTkButton(
+            url_row,
+            text="📋 Paste",
+            width=65,
+            height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self._paste_yt_url
+        )
+        btn_paste_url.pack(side="left")
+
+        # Quality + Download Button Row
+        act_row = ctk.CTkFrame(self.yt_tools_card, fg_color="transparent")
+        act_row.pack(fill="x", padx=12, pady=(0, 6))
+
+        lbl_q = ctk.CTkLabel(act_row, text="Quality:", font=ctk.CTkFont(size=11))
+        lbl_q.pack(side="left", padx=(0, 6))
+
+        self.yt_quality_menu = ctk.CTkOptionMenu(
+            act_row,
+            values=["Highest Available (4K/1080p)", "1080p Full HD", "720p HD"],
+            width=175,
+            height=28,
+            font=ctk.CTkFont(size=11)
+        )
+        self.yt_quality_menu.set("Highest Available (4K/1080p)")
+        self.yt_quality_menu.pack(side="left", padx=(0, 8))
+
+        self.btn_yt_download = ctk.CTkButton(
+            act_row,
+            text="⬇️ Download & Import",
+            height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#dc2626",
+            hover_color="#b91c1c",
+            command=self._start_yt_download
+        )
+        self.btn_yt_download.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        self.btn_yt_cancel = ctk.CTkButton(
+            act_row,
+            text="✖ Cancel",
+            width=60,
+            height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color="#475569",
+            hover_color="#64748b",
+            state="disabled",
+            command=self._cancel_yt_download
+        )
+        self.btn_yt_cancel.pack(side="left")
+
+        self.yt_progress_bar = ctk.CTkProgressBar(self.yt_tools_card)
+        self.yt_progress_bar.set(0.0)
+        self.yt_progress_bar.pack(fill="x", padx=12, pady=(4, 4))
+
+        self.yt_status_label = ctk.CTkLabel(
+            self.yt_tools_card,
+            text="Paste a YouTube link above and click Download & Import",
+            font=ctk.CTkFont(size=11),
+            text_color="#94a3b8"
+        )
+        self.yt_status_label.pack(anchor="w", padx=12, pady=(0, 8))
+
+        # -----------------------------------------------------------------
+        # B. CAPTIONS & SUBTITLES
+        # -----------------------------------------------------------------
+        cap_hdr = ctk.CTkFrame(self.yt_tools_card, fg_color="transparent")
+        cap_hdr.pack(fill="x", padx=12, pady=(4, 4))
+
+        sec_b_lbl = ctk.CTkLabel(cap_hdr, text="B. CAPTIONS & SUBTITLES", font=ctk.CTkFont(size=12, weight="bold"))
+        sec_b_lbl.pack(side="left")
+
+        self.yt_auto_captions_switch = ctk.CTkSwitch(
+            cap_hdr,
+            text="Auto Captions",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            variable=self.yt_auto_captions_var,
+            command=self._on_yt_auto_captions_toggled
+        )
+        self.yt_auto_captions_switch.pack(side="right")
+
+        self.yt_cap_box = ctk.CTkFrame(self.yt_tools_card, fg_color="transparent")
+        self.yt_cap_box.pack(fill="x", padx=12, pady=(0, 8))
+
+        sub_url_row = ctk.CTkFrame(self.yt_cap_box, fg_color="transparent")
+        sub_url_row.pack(fill="x", pady=(0, 5))
+
+        self.yt_sub_url_entry = ctk.CTkEntry(
+            sub_url_row,
+            placeholder_text="YouTube Subtitle URL (defaults to video URL)...",
+            font=ctk.CTkFont(size=11)
+        )
+        self.yt_sub_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        btn_paste_sub = ctk.CTkButton(
+            sub_url_row,
+            text="📋 Paste",
+            width=65,
+            height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self._paste_yt_sub_url
+        )
+        btn_paste_sub.pack(side="left")
+
+        sub_btn_row = ctk.CTkFrame(self.yt_cap_box, fg_color="transparent")
+        sub_btn_row.pack(fill="x", pady=(0, 4))
+
+        lbl_lang = ctk.CTkLabel(sub_btn_row, text="Lang:", font=ctk.CTkFont(size=11))
+        lbl_lang.pack(side="left", padx=(0, 4))
+
+        self.yt_sub_lang_menu = ctk.CTkOptionMenu(
+            sub_btn_row,
+            values=["Auto-Detect / English (en)", "Hindi (hi)", "Spanish (es)", "French (fr)", "German (de)", "All Available"],
+            width=150,
+            height=26,
+            font=ctk.CTkFont(size=10)
+        )
+        self.yt_sub_lang_menu.set("Auto-Detect / English (en)")
+        self.yt_sub_lang_menu.pack(side="left", padx=(0, 6))
+
+        self.btn_download_srt = ctk.CTkButton(
+            sub_btn_row,
+            text="📥 Download SRT",
+            height=26,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            command=self._start_download_subtitles_srt
+        )
+        self.btn_download_srt.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        self.btn_download_txt = ctk.CTkButton(
+            sub_btn_row,
+            text="📄 Download TXT",
+            height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self._start_download_subtitles_txt
+        )
+        self.btn_download_txt.pack(side="left")
+
+        self.yt_sub_status_label = ctk.CTkLabel(
+            self.yt_cap_box,
+            text="SRT automatically imports into Section 3 (Caption Editor)",
+            font=ctk.CTkFont(size=10),
+            text_color="#4ade80"
+        )
+        self.yt_sub_status_label.pack(anchor="w", pady=(0, 4))
+
+        # -----------------------------------------------------------------
+        # C. AUDIO ENHANCEMENT (NOISE REMOVAL)
+        # -----------------------------------------------------------------
+        enh_hdr = ctk.CTkFrame(self.yt_tools_card, fg_color="transparent")
+        enh_hdr.pack(fill="x", padx=12, pady=(4, 4))
+
+        sec_d_lbl = ctk.CTkLabel(enh_hdr, text="D. AUDIO ENHANCEMENT", font=ctk.CTkFont(size=12, weight="bold"))
+        sec_d_lbl.pack(side="left")
+
+        self.yt_noise_switch = ctk.CTkSwitch(
+            enh_hdr,
+            text="Auto Noise Removal",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            variable=self.yt_noise_removal_var
+        )
+        self.yt_noise_switch.pack(side="right")
+
+        noi_row = ctk.CTkFrame(self.yt_tools_card, fg_color="transparent")
+        noi_row.pack(fill="x", padx=12, pady=(0, 10))
+
+        lbl_int = ctk.CTkLabel(noi_row, text="Denoise Intensity:", font=ctk.CTkFont(size=11))
+        lbl_int.pack(side="left", padx=(0, 8))
+
+        self.yt_noise_intensity_seg = ctk.CTkSegmentedButton(
+            noi_row,
+            values=["Low", "Medium", "High"],
+            height=24,
+            command=self._on_yt_noise_intensity_changed
+        )
+        self.yt_noise_intensity_seg.set(self.yt_noise_intensity)
+        self.yt_noise_intensity_seg.pack(side="left", fill="x", expand=True)
+
+        # -----------------------------------------------------------------
+        # E. STORAGE & 2-DAY AUTO-RETENTION
+        # -----------------------------------------------------------------
+        sec_e_lbl = ctk.CTkLabel(self.yt_tools_card, text="E. STORAGE & RETENTION (2-DAY AUTO-EXPIRY)", font=ctk.CTkFont(size=12, weight="bold"))
+        sec_e_lbl.pack(anchor="w", padx=12, pady=(4, 2))
+
+        ret_info_lbl = ctk.CTkLabel(
+            self.yt_tools_card,
+            text="⏱️ Auto-Retention: YouTube loaded videos & assets older than 2 days are automatically deleted to save disk space.",
+            font=ctk.CTkFont(size=10),
+            text_color="#94a3b8"
+        )
+        ret_info_lbl.pack(anchor="w", padx=12, pady=(0, 6))
+
+        ret_btn_row = ctk.CTkFrame(self.yt_tools_card, fg_color="transparent")
+        ret_btn_row.pack(fill="x", padx=12, pady=(0, 10))
+
+        self.btn_clean_yt_old = ctk.CTkButton(
+            ret_btn_row,
+            text="🗑️ Clean 2d+ Old Videos",
+            height=26,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self._manual_clean_old_yt_videos
+        )
+        self.btn_clean_yt_old.pack(side="left", padx=(0, 6))
+
+        self.btn_open_yt_folder = ctk.CTkButton(
+            ret_btn_row,
+            text="📂 Open Downloads Folder",
+            height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color="#1e293b",
+            hover_color="#334155",
+            command=self._open_downloads_folder
+        )
+        self.btn_open_yt_folder.pack(side="left")
+
+        self.yt_cleanup_status_lbl = ctk.CTkLabel(
+            ret_btn_row,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color="#38bdf8"
+        )
+        self.yt_cleanup_status_lbl.pack(side="left", padx=(8, 0))
+
+    # -----------------------------------------------------------------
+    # YOUTUBE ACTIONS & WORKFLOW INTEGRATION
+    # -----------------------------------------------------------------
+    def _toggle_youtube_mode(self):
+        """Toggles YouTube integration tools on/off in both Shorts and Videos panels."""
+        self.yt_enabled = not getattr(self, "yt_enabled", False)
+        if self.yt_enabled:
+            self.btn_youtube_toggle.configure(
+                text="▶ YouTube ON",
+                fg_color="#dc2626",
+                hover_color="#b91c1c",
+                text_color="#ffffff",
+                border_color="#ef4444"
+            )
+            if hasattr(self, "yt_tools_card") and hasattr(self, "sec1_label"):
+                self.yt_tools_card.pack(fill="x", pady=(0, 14), before=self.sec1_label)
+        else:
+            self.btn_youtube_toggle.configure(
+                text="▶ YouTube OFF",
+                fg_color="#1e293b",
+                hover_color="#334155",
+                text_color="#f87171",
+                border_color="#dc2626"
+            )
+            if hasattr(self, "yt_tools_card"):
+                self.yt_tools_card.pack_forget()
+
+        self._update_scroll_region()
+        self._save_persistent_config()
+
     def _paste_yt_url(self):
         try:
-            clip_text = self.clipboard_get().strip()
-            if clip_text:
+            clip = self.clipboard_get().strip()
+            if clip:
                 self.yt_url_entry.delete(0, "end")
-                self.yt_url_entry.insert(0, clip_text)
+                self.yt_url_entry.insert(0, clip)
+                if not self.yt_sub_url_entry.get().strip():
+                    self.yt_sub_url_entry.delete(0, "end")
+                    self.yt_sub_url_entry.insert(0, clip)
+        except Exception:
+            pass
+
+    def _paste_yt_sub_url(self):
+        try:
+            clip = self.clipboard_get().strip()
+            if clip:
+                self.yt_sub_url_entry.delete(0, "end")
+                self.yt_sub_url_entry.insert(0, clip)
+        except Exception:
+            pass
+
+    def _paste_yt_music_url(self):
+        try:
+            clip = self.clipboard_get().strip()
+            if clip:
+                self.yt_music_url_entry.delete(0, "end")
+                self.yt_music_url_entry.insert(0, clip)
         except Exception:
             pass
 
@@ -1374,39 +1985,116 @@ class StudioClipperApp(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Error Opening Folder", str(e))
 
+    def _manual_clean_old_yt_videos(self):
+        try:
+            if hasattr(self, "btn_clean_yt_old"):
+                self.btn_clean_yt_old.configure(state="disabled", text="⏳ Cleaning...")
+            if hasattr(self, "yt_cleanup_status_lbl"):
+                self.yt_cleanup_status_lbl.configure(text="Scanning files...", text_color="#38bdf8")
+
+            def _clean_worker():
+                days = getattr(self, "yt_auto_delete_days", DEFAULT_EXPIRY_DAYS)
+                res = cleanup_expired_youtube_videos(max_age_days=days, verbose=True)
+                count = res.get("deleted_count", 0)
+                freed = res.get("freed_str", "0 MB")
+
+                def _finish():
+                    if hasattr(self, "btn_clean_yt_old"):
+                        self.btn_clean_yt_old.configure(state="normal", text="🗑️ Clean 2d+ Old Videos")
+                    if hasattr(self, "yt_cleanup_status_lbl"):
+                        if count > 0:
+                            msg = f"Cleaned {count} file(s) (> {days:.0f}d old), freed {freed}"
+                            self.yt_cleanup_status_lbl.configure(text=f"✅ {msg}", text_color="#4ade80")
+                        else:
+                            self.yt_cleanup_status_lbl.configure(
+                                text=f"✅ No files older than {days:.0f} days found",
+                                text_color="#38bdf8"
+                            )
+                    # If current video was deleted, reset UI if needed
+                    if hasattr(self, "video_path") and self.video_path and not os.path.exists(self.video_path):
+                        self.video_path = None
+                        if hasattr(self, "btn_select_video"):
+                            self.btn_select_video.configure(text="Choose Video File")
+                        if hasattr(self, "lbl_selected_video"):
+                            self.lbl_selected_video.configure(text="No video selected")
+                    if hasattr(self, "srt_path") and self.srt_path and not os.path.exists(self.srt_path):
+                        self.srt_path = None
+                        if hasattr(self, "srt_entry"):
+                            self.srt_entry.delete(0, "end")
+                    if hasattr(self, "music_path") and self.music_path and not os.path.exists(self.music_path):
+                        self.music_path = None
+                        if hasattr(self, "music_entry"):
+                            self.music_entry.delete(0, "end")
+
+                self.after(0, _finish)
+
+            threading.Thread(target=_clean_worker, daemon=True).start()
+        except Exception as e:
+            if hasattr(self, "btn_clean_yt_old"):
+                self.btn_clean_yt_old.configure(state="normal", text="🗑️ Clean 2d+ Old Videos")
+            if hasattr(self, "yt_cleanup_status_lbl"):
+                self.yt_cleanup_status_lbl.configure(text=f"❌ Error: {e}", text_color="#f87171")
+
+    def _periodic_yt_cleanup(self):
+        try:
+            def _worker():
+                days = getattr(self, "yt_auto_delete_days", DEFAULT_EXPIRY_DAYS)
+                cleanup_expired_youtube_videos(max_age_days=days, verbose=False)
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception:
+            pass
+        finally:
+            self.after(3600000, self._periodic_yt_cleanup)
+
     def _start_yt_download(self):
         url = self.yt_url_entry.get().strip()
         if not url:
-            messagebox.showwarning("Missing Link", "Please paste or enter a YouTube video or Shorts link.")
+            messagebox.showwarning("Missing Link", "Please paste or enter a YouTube video URL.")
             return
         if not (url.startswith("http://") or url.startswith("https://")):
             messagebox.showwarning("Invalid Link", "Please enter a valid link starting with https://")
             return
         if self.is_yt_downloading:
-            messagebox.showinfo("Download in Progress", "A YouTube download is already in progress. Please wait or click Cancel.")
+            messagebox.showinfo("In Progress", "A YouTube download is already in progress.")
             return
+
+        if not self.yt_sub_url_entry.get().strip():
+            self.yt_sub_url_entry.delete(0, "end")
+            self.yt_sub_url_entry.insert(0, url)
+
+        q_sel = self.yt_quality_menu.get()
+        quality = "best"
+        if "1080p" in q_sel:
+            quality = "1080p"
+        elif "720p" in q_sel:
+            quality = "720p"
 
         self.is_yt_downloading = True
         self.btn_yt_download.configure(state="disabled", text="⏳ Starting...")
         self.btn_yt_cancel.configure(state="normal")
         self.yt_progress_bar.set(0.0)
-        self.yt_title_label.configure(text="🔍 Fetching highest quality video & audio streams...")
         self.yt_status_label.configure(text="Connecting to YouTube...", text_color="#38bdf8")
 
-        # Clear any leftover messages from queue
         while not self.yt_msg_queue.empty():
             try:
                 self.yt_msg_queue.get_nowait()
             except Exception:
                 break
 
+        auto_cap = self.yt_auto_captions_var.get()
+
         self.yt_downloader = YouTubeDownloader(
             output_dir=DOWNLOADS_DIR,
             progress_callback=lambda d: self.yt_msg_queue.put(("progress", d)),
             completion_callback=lambda f: self.yt_msg_queue.put(("complete", f)),
             error_callback=lambda e: self.yt_msg_queue.put(("error", e)),
+            auto_cleanup_days=getattr(self, "yt_auto_delete_days", DEFAULT_EXPIRY_DAYS)
         )
-        self.yt_downloader.start_download_async(url)
+        self.yt_downloader.start_download_async(
+            url,
+            quality=quality,
+            extract_captions=auto_cap
+        )
         self.after(50, self._check_yt_queue)
 
     def _check_yt_queue(self):
@@ -1427,11 +2115,6 @@ class StudioClipperApp(ctk.CTk):
 
     def _on_yt_progress(self, data: Dict[str, Any]):
         status = data.get("status")
-        title = data.get("title", "")
-        if title:
-            clean_title = title if len(title) <= 55 else title[:55] + "..."
-            self.yt_title_label.configure(text=f"🎬 {clean_title}")
-
         pct = data.get("percent", 0.0)
         self.yt_progress_bar.set(pct / 100.0)
 
@@ -1442,13 +2125,7 @@ class StudioClipperApp(ctk.CTk):
             eta = data.get("eta", "")
             size = data.get("size", "")
             stat_text = f"⬇️ {stream}: {pct:.1f}%"
-            details = []
-            if size:
-                details.append(size)
-            if speed:
-                details.append(speed)
-            if eta and eta != "--:--":
-                details.append(f"ETA {eta}")
+            details = [x for x in [size, speed, f"ETA {eta}" if eta and eta != "--:--" else ""] if x]
             if details:
                 stat_text += f" ({', '.join(details)})"
             self.yt_status_label.configure(text=stat_text, text_color="#38bdf8")
@@ -1460,43 +2137,288 @@ class StudioClipperApp(ctk.CTk):
             )
         elif status in ["starting", "fetching_info"]:
             self.yt_status_label.configure(text=data.get("message", "Fetching info..."), text_color="#94a3b8")
+        elif status == "retrying":
+            self.btn_yt_download.configure(state="disabled", text="🔄 Resuming...")
+            self.yt_status_label.configure(
+                text=data.get("message", "🔄 Network stalled. Resuming download..."),
+                text_color="#f59e0b"
+            )
         elif status == "cancelled":
             self.yt_status_label.configure(text="Download cancelled", text_color="#ef4444")
 
     def _on_yt_complete(self, filepath: str):
         self.is_yt_downloading = False
-        self.btn_yt_download.configure(state="normal", text="⬇️ Download")
+        self.btn_yt_download.configure(state="normal", text="⬇️ Download & Import")
         self.btn_yt_cancel.configure(state="disabled")
         self.yt_progress_bar.set(1.0)
-        filename = Path(filepath).name
-        self.yt_title_label.configure(text=f"🎬 {filename}")
         self.yt_status_label.configure(
-            text=f"✅ Downloaded & Loaded into Clipper! (Highest Quality Merged)",
+            text=f"✅ Video Downloaded & Loaded into {self.active_mode.title()}!",
             text_color="#4ade80"
         )
-        # Automatically load into Clipper
         if os.path.exists(filepath):
+            # Load into existing active Shorts/Videos editor
             self._load_video(filepath)
+
+            # Auto-check subtitles if enabled
+            if self.yt_auto_captions_var.get():
+                sub_path = find_matching_subtitles(filepath)
+                if sub_path and os.path.exists(sub_path):
+                    self.srt_entry.delete(0, "end")
+                    self.srt_entry.insert(0, sub_path)
+                    self.sub_switch_var.set(True)
+                    self.srt_path = sub_path
+                    self._render_visual_crop()
+                    self.yt_sub_status_label.configure(text=f"✅ Subtitles Auto-Imported: {Path(sub_path).name}", text_color="#4ade80")
+                else:
+                    # Speech-to-Text Fallback using Whisper AI
+                    auto_srt = str(Path(filepath).with_suffix(".srt"))
+                    self.yt_sub_status_label.configure(text="🎙️ Transcribing dialogue with Whisper AI...", text_color="#38bdf8")
+                    def _gen_stt():
+                        ok = generate_speech_timed_srt(filepath, auto_srt)
+                        if ok and os.path.exists(auto_srt):
+                            def _load_stt():
+                                self.srt_entry.delete(0, "end")
+                                self.srt_entry.insert(0, auto_srt)
+                                self.sub_switch_var.set(True)
+                                self.srt_path = auto_srt
+                                self._render_visual_crop()
+                                self.yt_sub_status_label.configure(text="✅ Whisper AI Captions Generated & Loaded!", text_color="#4ade80")
+                            self.after(0, _load_stt)
+                        else:
+                            self.after(0, lambda: self.yt_sub_status_label.configure(text="⚠️ No captions available", text_color="#f87171"))
+                    threading.Thread(target=_gen_stt, daemon=True).start()
 
     def _on_yt_error(self, err_msg: str):
         self.is_yt_downloading = False
-        self.btn_yt_download.configure(state="normal", text="⬇️ Download")
+        self.btn_yt_download.configure(state="normal", text="⬇️ Download & Import")
         self.btn_yt_cancel.configure(state="disabled")
-        self.yt_status_label.configure(text=f"❌ Failed: {err_msg[:75]}", text_color="#f87171")
-        messagebox.showerror("YouTube Download Error", f"Failed to download video:\n\n{err_msg}")
+        self.yt_status_label.configure(text=f"❌ Failed: {err_msg[:70]}", text_color="#f87171")
+        friendly_msg = err_msg
+        if "timed out" in err_msg.lower() or "read operation" in err_msg.lower():
+            friendly_msg = (
+                f"{err_msg}\n\n"
+                "💡 Tip: YouTube's connection stalled or experienced network latency.\n"
+                "Any partially downloaded chunks have been preserved. Clicking 'Download & Import' again will automatically resume right where it left off."
+            )
+        messagebox.showerror("YouTube Download Error", f"Failed to download video:\n\n{friendly_msg}")
 
     def _cancel_yt_download(self):
         if self.yt_downloader and self.is_yt_downloading:
             self.yt_downloader.cancel()
         self.is_yt_downloading = False
-        self.btn_yt_download.configure(state="normal", text="⬇️ Download")
+        self.btn_yt_download.configure(state="normal", text="⬇️ Download & Import")
         self.btn_yt_cancel.configure(state="disabled")
         self.yt_progress_bar.set(0.0)
         self.yt_status_label.configure(text="Download cancelled by user", text_color="#94a3b8")
 
+    def _on_yt_auto_captions_toggled(self):
+        on = self.yt_auto_captions_var.get()
+        if on:
+            self.yt_cap_box.pack(fill="x", padx=12, pady=(0, 8))
+        else:
+            self.yt_cap_box.pack_forget()
+        self._update_scroll_region()
+        self._save_persistent_config()
+
+    def _start_download_subtitles_srt(self):
+        url = self.yt_sub_url_entry.get().strip() or self.yt_url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Missing Link", "Please paste or enter a YouTube URL to download captions.")
+            return
+
+        lang_val = self.yt_sub_lang_menu.get()
+        self.btn_download_srt.configure(state="disabled", text="⏳ Downloading...")
+        self.yt_sub_status_label.configure(text="Fetching subtitles from YouTube...", text_color="#38bdf8")
+
+        def _worker():
+            try:
+                dl = YouTubeDownloader(output_dir=DOWNLOADS_DIR)
+                srt_path = dl.download_subtitles(url, lang=lang_val, as_txt=False)
+                if srt_path and os.path.exists(srt_path):
+                    def _apply():
+                        self.btn_download_srt.configure(state="normal", text="📥 Download SRT")
+                        self.srt_entry.delete(0, "end")
+                        self.srt_entry.insert(0, srt_path)
+                        self.sub_switch_var.set(True)
+                        self.srt_path = srt_path
+                        self._render_visual_crop()
+                        self._update_cli_display()
+                        self.yt_sub_status_label.configure(text=f"✅ Loaded: {Path(srt_path).name}", text_color="#4ade80")
+                        self._save_persistent_config()
+                    self.after(0, _apply)
+                else:
+                    # Speech-to-text fallback if video is available
+                    if self.video_path and os.path.exists(self.video_path):
+                        fallback_srt = str(Path(self.video_path).with_suffix(".srt"))
+                        ok = generate_speech_timed_srt(self.video_path, fallback_srt)
+                        if ok and os.path.exists(fallback_srt):
+                            def _apply_fb():
+                                self.btn_download_srt.configure(state="normal", text="📥 Download SRT")
+                                self.srt_entry.delete(0, "end")
+                                self.srt_entry.insert(0, fallback_srt)
+                                self.sub_switch_var.set(True)
+                                self.srt_path = fallback_srt
+                                self._render_visual_crop()
+                                self.yt_sub_status_label.configure(text="✅ Whisper AI Captions Generated!", text_color="#4ade80")
+                            self.after(0, _apply_fb)
+                            return
+
+                    def _fail():
+                        self.btn_download_srt.configure(state="normal", text="📥 Download SRT")
+                        self.yt_sub_status_label.configure(text="⚠️ No subtitles found on YouTube for this video", text_color="#f87171")
+                        messagebox.showinfo("Captions Unavailable", "No subtitles were found on YouTube for this video.\nIf the video is already downloaded, Speech-to-Text can generate timestamps.")
+                    self.after(0, _fail)
+            except Exception as e:
+                err_str = str(e)
+                self.after(0, lambda: self.btn_download_srt.configure(state="normal", text="📥 Download SRT"))
+                self.after(0, lambda: self.yt_sub_status_label.configure(text=f"❌ Error: {err_str[:60]}", text_color="#f87171"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _start_download_subtitles_txt(self):
+        url = self.yt_sub_url_entry.get().strip() or self.yt_url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Missing Link", "Please paste or enter a YouTube URL to download transcript.")
+            return
+
+        lang_val = self.yt_sub_lang_menu.get()
+        self.btn_download_txt.configure(state="disabled", text="⏳...")
+
+        def _worker():
+            try:
+                dl = YouTubeDownloader(output_dir=DOWNLOADS_DIR)
+                txt_path = dl.download_subtitles(url, lang=lang_val, as_txt=True)
+                if txt_path and os.path.exists(txt_path):
+                    def _done():
+                        self.btn_download_txt.configure(state="normal", text="📄 Download TXT")
+                        self.yt_sub_status_label.configure(text=f"✅ Plain text transcript saved & opened!", text_color="#4ade80")
+                        subprocess.run(["open", str(txt_path)])
+                    self.after(0, _done)
+                else:
+                    def _fail():
+                        self.btn_download_txt.configure(state="normal", text="📄 Download TXT")
+                        self.yt_sub_status_label.configure(text="⚠️ No transcript found for this video", text_color="#f87171")
+                    self.after(0, _fail)
+            except Exception as e:
+                err_str = str(e)
+                self.after(0, lambda: self.btn_download_txt.configure(state="normal", text="📄 Download TXT"))
+                self.after(0, lambda: self.yt_sub_status_label.configure(text=f"❌ Error: {err_str[:60]}", text_color="#f87171"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _start_yt_audio_download(self):
+        url = self.yt_music_url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Missing Link", "Please paste or enter a YouTube music / audio URL.")
+            return
+
+        self.btn_yt_music_dl.configure(state="disabled", text="⏳ Downloading...")
+        self.yt_music_status_label.configure(text="Downloading & extracting MP3...", text_color="#38bdf8")
+
+        def _worker():
+            try:
+                dl = YouTubeDownloader(output_dir=AUDIO_DOWNLOADS_DIR)
+                mp3_path = dl.download_audio(url)
+                if mp3_path and os.path.exists(mp3_path):
+                    self.after(0, lambda: self._on_yt_audio_complete(mp3_path))
+                else:
+                    self.after(0, lambda: self._on_yt_audio_error("Failed to extract MP3 audio."))
+            except Exception as e:
+                self.after(0, lambda err=str(e): self._on_yt_audio_error(err))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_yt_audio_complete(self, mp3_path: str):
+        self.btn_yt_music_dl.configure(state="normal", text="🎵 Download Music")
+        self.music_entry.delete(0, "end")
+        self.music_entry.insert(0, mp3_path)
+        self.music_switch_var.set(True)
+        self.music_path = mp3_path
+        self.yt_music_status_label.configure(
+            text=f"✅ Loaded into Section 4: {Path(mp3_path).name}",
+            text_color="#4ade80"
+        )
+        self._update_cli_display()
+        self._save_persistent_config()
+
+    def _on_yt_audio_error(self, err_msg: str):
+        self.btn_yt_music_dl.configure(state="normal", text="🎵 Download Music")
+        self.yt_music_status_label.configure(text=f"❌ Error: {err_msg[:60]}", text_color="#f87171")
+        messagebox.showerror("Audio Download Error", err_msg)
+
+    def _toggle_yt_audio_preview(self):
+        if getattr(self, "yt_is_playing_audio", False):
+            if hasattr(self, "yt_audio_player_proc") and self.yt_audio_player_proc:
+                try:
+                    self.yt_audio_player_proc.terminate()
+                except Exception:
+                    pass
+                self.yt_audio_player_proc = None
+            self.yt_is_playing_audio = False
+            self.btn_yt_audio_preview.configure(text="▶ Play Preview", fg_color="#10b981")
+        else:
+            target_music = self.music_entry.get().strip() or getattr(self, "music_path", "")
+            if not target_music or not os.path.exists(target_music):
+                messagebox.showwarning("No Audio Track", "Please download or choose an audio track in Section 4 first.")
+                return
+            try:
+                self.yt_audio_player_proc = subprocess.Popen(["/usr/bin/afplay", target_music])
+                self.yt_is_playing_audio = True
+                self.btn_yt_audio_preview.configure(text="⏹ Stop", fg_color="#ef4444")
+
+                def _monitor():
+                    if self.yt_audio_player_proc:
+                        self.yt_audio_player_proc.wait()
+                    self.after(0, lambda: self.btn_yt_audio_preview.configure(text="▶ Play Preview", fg_color="#10b981"))
+                    self.yt_is_playing_audio = False
+
+                threading.Thread(target=_monitor, daemon=True).start()
+            except Exception as e:
+                messagebox.showerror("Audio Playback Error", str(e))
+
+    def _on_yt_noise_intensity_changed(self, value: str):
+        self.yt_noise_intensity = value
+        self._save_persistent_config()
+
     # ==============================================================
     # FILE BROWSING & DATA LOADING
     # ==============================================================
+    def _on_video_entry_submitted(self):
+        val = self.video_entry.get().strip().strip("'\"")
+        if not val:
+            return
+        if os.path.exists(val) and os.path.isfile(val):
+            if val != getattr(self, "video_path", None):
+                self._load_video(val)
+        elif val.startswith(("http://", "https://", "www.youtube.com", "youtu.be")):
+            if hasattr(self, "yt_url_entry"):
+                self.yt_url_entry.delete(0, "end")
+                self.yt_url_entry.insert(0, val)
+                if not self.yt_enabled:
+                    self._toggle_youtube_mode()
+                messagebox.showinfo("YouTube Link Detected", "Link pasted into YouTube Downloader above.\nClick 'Download & Import' to download and load this video into the editor!")
+
+    def _paste_and_load_video(self):
+        try:
+            val = self.clipboard_get().strip().strip("'\"")
+        except Exception:
+            return
+        if not val:
+            return
+        if os.path.exists(val) and os.path.isfile(val):
+            self._load_video(val)
+        elif val.startswith(("http://", "https://", "www.youtube.com", "youtu.be")):
+            if hasattr(self, "yt_url_entry"):
+                self.yt_url_entry.delete(0, "end")
+                self.yt_url_entry.insert(0, val)
+                if not self.yt_enabled:
+                    self._toggle_youtube_mode()
+                messagebox.showinfo("YouTube Link Detected", "Link pasted into YouTube Downloader above.\nClick 'Download & Import' to download and load this video into the editor!")
+        else:
+            self.video_entry.delete(0, "end")
+            self.video_entry.insert(0, val)
+            self._on_video_entry_submitted()
+
     def _browse_video(self):
         file_path = filedialog.askopenfilename(
             title="Choose Video File",
@@ -1509,9 +2431,17 @@ class StudioClipperApp(ctk.CTk):
             self._load_video(file_path)
 
     def _load_video(self, file_path: str):
+        if not file_path or not os.path.exists(file_path):
+            return
         self.video_path = file_path
         self.video_entry.delete(0, "end")
         self.video_entry.insert(0, file_path)
+
+        if hasattr(self, "shorts_config"):
+            self.shorts_config["video_path"] = file_path
+        if hasattr(self, "videos_config"):
+            self.videos_config["video_path"] = file_path
+        self._save_persistent_config()
 
         try:
             self.video_info = probe_video(file_path)
@@ -1639,7 +2569,7 @@ class StudioClipperApp(ctk.CTk):
 
         def _worker():
             try:
-                ok, err = combine_video_audio(vid, aud, save_path)
+                ok, err = combine_video_audio(vid, aud, save_path, video_volume=getattr(self, "current_video_vol", 1.0))
                 if not ok:
                     raise RuntimeError(err)
 
@@ -1671,23 +2601,42 @@ class StudioClipperApp(ctk.CTk):
 
     def _extract_keyframe(self, video_path: str):
         """Extracts 1 frame snapshot for the visual crop framing box."""
-        try:
-            cmd = [
+        dur = float(self.video_info.get("duration", 0.0)) if self.video_info else 0.0
+        seek_ts = "00:00:02" if dur > 5.0 else ("00:00:01" if dur > 1.0 else "00:00:00")
+
+        # Try seeking first
+        cmd = [
+            "ffmpeg", "-y",
+            "-err_detect", "ignore_err",
+            "-max_error_rate", "1.0",
+            "-ss", seek_ts,
+            "-i", video_path,
+            "-frames:v", "1",
+            "-update", "1",
+            "-q:v", "2",
+            self.raw_frame_path
+        ]
+        p = subprocess.run(cmd, capture_output=True)
+        if p.returncode != 0 or not os.path.exists(self.raw_frame_path) or os.path.getsize(self.raw_frame_path) == 0:
+            # Fallback: extract first frame directly without seek
+            cmd_fb = [
                 "ffmpeg", "-y",
                 "-err_detect", "ignore_err",
-                "-max_error_rate", "1.0",
-                "-ss", "00:00:03",
                 "-i", video_path,
                 "-frames:v", "1",
                 "-update", "1",
                 "-q:v", "2",
                 self.raw_frame_path
             ]
-            subprocess.run(cmd, capture_output=True, check=True)
-            if os.path.exists(self.raw_frame_path):
+            subprocess.run(cmd_fb, capture_output=True)
+
+        try:
+            if os.path.exists(self.raw_frame_path) and os.path.getsize(self.raw_frame_path) > 0:
                 self.base_frame_image = Image.open(self.raw_frame_path).convert("RGB")
+            else:
+                self.base_frame_image = None
         except Exception as e:
-            print("Failed to capture snapshot frame:", e)
+            print("Failed to open snapshot frame:", e)
             self.base_frame_image = None
 
     def _browse_srt(self):
@@ -1706,18 +2655,45 @@ class StudioClipperApp(ctk.CTk):
             self.srt_path = path
             self.srt_entry.delete(0, "end")
             self.srt_entry.insert(0, path)
+            self._render_visual_crop()
             self._update_cli_display()
+            self._save_persistent_config()
 
     def _browse_music(self):
         path = filedialog.askopenfilename(
             title="Choose Background Music File",
-            filetypes=[("Audio Files", "*.mp3 *.wav *.m4a *.aac *.ogg"), ("All Files", "*.*")]
+            filetypes=[
+                ("Audio Files", "*.mp3 *.wav *.m4a *.aac *.ogg *.flac *.opus *.wma"),
+                ("All Files", "*.*")
+            ]
         )
         if path:
             self.music_path = path
             self.music_entry.delete(0, "end")
             self.music_entry.insert(0, path)
+            self.music_switch_var.set(True)
+            if hasattr(self, "yt_music_status_label"):
+                self.yt_music_status_label.configure(
+                    text=f"✅ Loaded Music: {Path(path).name}",
+                    text_color="#4ade80"
+                )
             self._update_cli_display()
+            self._save_persistent_config()
+
+    def _on_music_entry_changed(self, event=None):
+        path = self.music_entry.get().strip()
+        if path and os.path.exists(path):
+            self.music_path = path
+            self.music_switch_var.set(True)
+            if hasattr(self, "yt_music_status_label"):
+                self.yt_music_status_label.configure(
+                    text=f"✅ Loaded Music: {Path(path).name}",
+                    text_color="#4ade80"
+                )
+        elif not path:
+            self.music_path = None
+        self._update_cli_display()
+        self._save_persistent_config()
 
     # ==============================================================
     # SHORTS vs VIDEOS MODE SWITCHING & STATE SYNC
@@ -1740,6 +2716,9 @@ class StudioClipperApp(ctk.CTk):
         cfg["bottom_fade"] = self.bottom_fade_var.get()
         cfg["fade_height"] = self.fade_height
         cfg["fade_opacity"] = self.fade_opacity
+        cfg["vol"] = self.current_vol
+        self.shorts_config["vol"] = self.current_vol
+        self.videos_config["vol"] = self.current_vol
 
         self._save_persistent_config()
 
@@ -1754,6 +2733,7 @@ class StudioClipperApp(ctk.CTk):
             sub_on = self.sub_switch_var.get() if hasattr(self, "sub_switch_var") else True
             audio_on = self.audio_switch_var.get() if hasattr(self, "audio_switch_var") else True
             audio_entry_val = self.audio_entry.get().strip() if hasattr(self, "audio_entry") else ""
+            m_path_val = self.music_entry.get().strip() if hasattr(self, "music_entry") else getattr(self, "music_path", "") or ""
             music_on = self.music_switch_var.get() if hasattr(self, "music_switch_var") else True
             skip_on = self.skip_existing_var.get() if hasattr(self, "skip_existing_var") else True
 
@@ -1761,10 +2741,11 @@ class StudioClipperApp(ctk.CTk):
                 "active_mode": self.active_mode,
                 "shorts_config": copy.deepcopy(self.shorts_config),
                 "videos_config": copy.deepcopy(self.videos_config),
-                # Section 1: Paired High-Quality Audio
+                # Section 1: Paired High-Quality Audio & Main Video Volume
                 "audio": {
                     "enabled": audio_on,
                     "path": audio_entry_val or getattr(self, "audio_path", "") or "",
+                    "video_volume": getattr(self, "current_video_vol", 1.0),
                 },
                 # Section 3: Universal Subtitles Configuration
                 "subtitles": {
@@ -1774,15 +2755,25 @@ class StudioClipperApp(ctk.CTk):
                     "font": cap_font,
                     "size": cap_size,
                     "border": cap_border,
-                    "position": cap_pos
+                    "position": cap_pos,
+                    "pos_y": getattr(self, "sub_pos_y", 0.15),
+                    "overflow": self.caption_overflow_var.get() if hasattr(self, "caption_overflow_var") else getattr(self, "saved_caption_overflow", False)
                 },
                 # Section 4: Universal Music & Volume Configuration
                 "music": {
                     "enabled": music_on,
-                    "path": getattr(self, "music_path", "") or "",
+                    "path": m_path_val,
                     "volume": self.current_vol
                 },
-                "skip_existing": skip_on
+                "skip_existing": skip_on,
+                # YouTube Integration State (Saved across restarts)
+                "youtube_config": {
+                    "enabled": getattr(self, "yt_enabled", False),
+                    "auto_captions": self.yt_auto_captions_var.get() if hasattr(self, "yt_auto_captions_var") else True,
+                    "noise_removal": self.yt_noise_removal_var.get() if hasattr(self, "yt_noise_removal_var") else True,
+                    "noise_intensity": getattr(self, "yt_noise_intensity", "Medium"),
+                    "auto_delete_after_days": getattr(self, "yt_auto_delete_days", DEFAULT_EXPIRY_DAYS)
+                }
             }
             save_saved_config(cfg)
         except Exception:
@@ -1794,6 +2785,9 @@ class StudioClipperApp(ctk.CTk):
         """
         if self.active_mode == new_mode:
             return
+
+        if hasattr(self, "yt_active_mode_lbl"):
+            self.yt_active_mode_lbl.configure(text="Active Target: " + ("📱 Shorts" if new_mode == "shorts" else "🎬 Videos"))
 
         # 1. Save current controls into current profile
         self._sync_to_active_config()
@@ -1825,10 +2819,11 @@ class StudioClipperApp(ctk.CTk):
             self.btn_preset_zero.configure(text="🎬 Cinema (12% / 12%)", command=lambda: self._set_custom_padding(12.0, 12.0))
             cfg = self.videos_config
 
-        # 3. Section 1 (Source Video): restore saved video if set specifically for this mode
-        mode_video = cfg.get("video_path")
-        if mode_video and os.path.exists(mode_video) and mode_video != self.video_path:
-            self._load_video(mode_video)
+        # 3. Section 1 (Source Video): keep current video if valid; otherwise restore saved video
+        if not (self.video_path and os.path.exists(self.video_path)):
+            mode_video = cfg.get("video_path")
+            if mode_video and os.path.exists(mode_video):
+                self._load_video(mode_video)
 
         # 4. Section 2 (Aspect Ratio & Crop Framing): apply mode profile
         self.current_ratio = cfg["ratio_val"]
@@ -2147,6 +3142,97 @@ class StudioClipperApp(ctk.CTk):
         self._update_cli_display()
         self._save_persistent_config()
 
+    def _on_sub_pos_slider_changed(self, value, refresh=True):
+        self.sub_pos_y = round(float(value), 3)
+        pct = int(round(self.sub_pos_y * 100))
+        self.sub_pos_label_var.set(f"Vertical Position (Y): {pct}%")
+        self._sync_sub_pos_menu_preset(pct)
+        if refresh:
+            self._render_visual_crop()
+            self._update_cli_display()
+            self._save_persistent_config()
+
+    def _step_sub_pos_minus(self):
+        new_val = max(0.0, round(self.sub_pos_y - 0.01, 3))
+        self.sub_pos_slider.set(new_val)
+        self._on_sub_pos_slider_changed(new_val)
+
+    def _step_sub_pos_plus(self):
+        new_val = min(0.90, round(self.sub_pos_y + 0.01, 3))
+        self.sub_pos_slider.set(new_val)
+        self._on_sub_pos_slider_changed(new_val)
+
+    def _on_sub_pos_preset_selected(self, choice: str):
+        if "15%" in choice or "Above Padding" in choice:
+            target = 0.15
+        elif "6%" in choice or "Inside Bottom" in choice:
+            target = 0.06
+        elif "50%" in choice or "Center" in choice:
+            target = 0.50
+        elif "75%" in choice or "Upper" in choice:
+            target = 0.75
+        elif "85%" in choice or "Top" in choice:
+            target = 0.85
+        else:
+            target = self.sub_pos_y
+        self.sub_pos_slider.set(target)
+        self._on_sub_pos_slider_changed(target)
+
+    def _sync_sub_pos_menu_preset(self, pct: int):
+        if not hasattr(self, "sub_pos_menu"):
+            return
+        if pct == 15:
+            self.sub_pos_menu.set("✨ Above Padding (15%)")
+        elif pct == 6:
+            self.sub_pos_menu.set("🖤 Inside Bottom Bar (6%)")
+        elif pct == 50:
+            self.sub_pos_menu.set("🎯 Screen Center (50%)")
+        elif pct == 75:
+            self.sub_pos_menu.set("⬆️ Upper Third (75%)")
+        elif pct == 85:
+            self.sub_pos_menu.set("🔝 Top Edge (85%)")
+        else:
+            self.sub_pos_menu.set("⚙️ Custom Position")
+
+    def _on_caption_overflow_toggle(self):
+        is_overflow = bool(self.caption_overflow_var.get())
+        self._update_caption_overflow_ui(is_overflow)
+
+    def _set_caption_overflow(self, overflow: bool):
+        self.caption_overflow_var.set(overflow)
+        self._update_caption_overflow_ui(overflow)
+
+    def _update_caption_overflow_ui(self, overflow: bool):
+        if hasattr(self, "overflow_label_var"):
+            self.overflow_label_var.set(
+                "Caption Flow: ⋯ Overflow (Single Line)" if overflow else "Caption Flow: ⤹ Word Wrap (Multi-Line)"
+            )
+        if hasattr(self, "btn_flow_wrap") and hasattr(self, "btn_flow_overflow"):
+            if overflow:
+                self.btn_flow_overflow.configure(fg_color="#2563eb", hover_color="#1d4ed8")
+                self.btn_flow_wrap.configure(fg_color="#2b3245", hover_color="#3b445c")
+            else:
+                self.btn_flow_wrap.configure(fg_color="#2563eb", hover_color="#1d4ed8")
+                self.btn_flow_overflow.configure(fg_color="#2b3245", hover_color="#3b445c")
+        self._render_visual_crop()
+        self._update_cli_display()
+        self._save_persistent_config()
+
+    def _video_vol_step_minus(self):
+        new_val = max(0.0, min(3.0, round(self.video_vol_slider.get() - 0.05, 2)))
+        self.video_vol_slider.set(new_val)
+        self._on_video_vol_slider_changed(new_val)
+
+    def _video_vol_step_plus(self):
+        new_val = max(0.0, min(3.0, round(self.video_vol_slider.get() + 0.05, 2)))
+        self.video_vol_slider.set(new_val)
+        self._on_video_vol_slider_changed(new_val)
+
+    def _set_video_vol(self, val: float):
+        val = max(0.0, min(3.0, round(val, 2)))
+        self.video_vol_slider.set(val)
+        self._on_video_vol_slider_changed(val)
+
     def _vol_step_minus(self):
         new_val = max(0.0, min(0.5, round(self.vol_slider.get() - 0.01, 2)))
         self.vol_slider.set(new_val)
@@ -2231,6 +3317,7 @@ class StudioClipperApp(ctk.CTk):
         self._drag_start_pos_y = self.current_pos_y
 
     def _on_preview_drag_motion(self, event):
+
         if not self.video_info or not hasattr(self, "_preview_geom"):
             return
         geom = self._preview_geom
@@ -2336,37 +3423,71 @@ class StudioClipperApp(ctk.CTk):
             self._render_visual_crop()
             self._update_cli_display()
 
+    def _on_video_vol_slider_changed(self, value: float):
+        self.current_video_vol = round(float(value), 2)
+        pct = int(round(self.current_video_vol * 100))
+        if self.current_video_vol == 0:
+            lbl = "🔇 Main Video Sound: Muted (0%)"
+        elif abs(self.current_video_vol - 1.0) < 0.01:
+            lbl = "🔊 Main Video Sound: 100% (Normal)"
+        elif self.current_video_vol > 1.0:
+            lbl = f"🔊 Main Video Sound: {pct}% ({self.current_video_vol:.2f}x Boost 🚀)"
+        else:
+            lbl = f"🔉 Main Video Sound: {pct}% ({self.current_video_vol:.2f}x)"
+        self.video_vol_label_var.set(lbl)
+        self._save_persistent_config()
+        self._update_cli_display()
+
     def _on_vol_slider_changed(self, value: float):
         self.current_vol = float(value)
         pct = int(round(self.current_vol * 100))
         self.vol_label_var.set(f"Background Volume: {pct}% (Speech stays crisp)")
+        self.shorts_config["vol"] = self.current_vol
+        self.videos_config["vol"] = self.current_vol
         self._sync_to_active_config()
         self._update_cli_display()
 
     def _render_visual_crop(self):
         """Draws visual crop dynamically supporting Shorts (9:16, 1:1, 4:5) and Videos (16:9, etc.)."""
+        target_display_w = 480
+        target_display_h = 260
+
         if not self.video_info:
             return
 
         in_w = self.video_info.get("width", 1920)
         in_h = self.video_info.get("height", 1080)
+        cur_ratio = self.current_ratio
+        cur_pos_x = self.current_pos_x
+        cur_pos_y = self.current_pos_y
+        cur_scale = self.current_scale
+        cur_pad_t = self.current_pad_top
+        cur_pad_b = self.current_pad_bottom
+        bottom_fade_on = self.bottom_fade_var.get()
+        fade_h_val = self.fade_height
+        fade_o_val = self.fade_opacity
+        cap_style_val = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
+        cap_font_val = self._get_selected_font_name()
+        cap_border_val = self._get_selected_caption_border()
+        sub_y_val = getattr(self, "sub_pos_y", 0.15)
+        base_frame = self.base_frame_image
+        mode_label = "📱 Shorts" if self.active_mode == "shorts" else "🎬 Videos"
 
         crop_filter, crop_w, crop_h, off_x, off_y = compute_crop_filter(
             in_w=in_w,
             in_h=in_h,
-            ratio=self.current_ratio,
-            pos_x=self.current_pos_x,
-            pos_y=self.current_pos_y,
-            scale=self.current_scale,
-            pad_top=self.current_pad_top,
-            pad_bottom=self.current_pad_bottom
+            ratio=cur_ratio,
+            pos_x=cur_pos_x,
+            pos_y=cur_pos_y,
+            scale=cur_scale,
+            pad_top=cur_pad_t,
+            pad_bottom=cur_pad_b
         )
 
-        fade_status = "ON (🖤)" if self.bottom_fade_var.get() else "OFF"
-        pad_status = f"Pad: T:{self.current_pad_top:.1f}% B:{self.current_pad_bottom:.1f}%"
-        mode_label = "📱 Shorts" if self.active_mode == "shorts" else "🎬 Videos"
+        fade_status = "ON (🖤)" if bottom_fade_on else "OFF"
+        pad_status = f"Pad: T:{cur_pad_t:.1f}% B:{cur_pad_b:.1f}%"
         self.filter_info_label.configure(
-            text=f"Mode: {mode_label} ({self.current_ratio}) | FFmpeg: {crop_filter}\nFraming: Scale {self.current_scale:.2f}x | X {int(self.current_pos_x*100)}% | Y {int(self.current_pos_y*100)}% | {pad_status} | Fade: {fade_status}"
+            text=f"Mode: {mode_label} ({cur_ratio}) | FFmpeg: {crop_filter}\nFraming: Scale {cur_scale:.2f}x | X {int(cur_pos_x*100)}% | Y {int(cur_pos_y*100)}% | {pad_status} | Fade: {fade_status}"
         )
 
         target_display_w = 480
@@ -2378,7 +3499,7 @@ class StudioClipperApp(ctk.CTk):
             d_bg = ImageDraw.Draw(bg)
 
             # Determine target aspect ratio
-            r_str = str(self.current_ratio).strip().lower()
+            r_str = str(cur_ratio).strip().lower()
             if r_str in ["16:9", "original", "none", "full"]:
                 target_aspect = 16.0 / 9.0
             elif r_str == "9:16":
@@ -2411,8 +3532,8 @@ class StudioClipperApp(ctk.CTk):
             ry1 = (target_display_h - frame_h) // 2
             ry2 = ry1 + frame_h
 
-            pad_t_px = int(round(frame_h * (self.current_pad_top / 100.0)))
-            pad_b_px = int(round(frame_h * (self.current_pad_bottom / 100.0)))
+            pad_t_px = int(round(frame_h * (cur_pad_t / 100.0)))
+            pad_b_px = int(round(frame_h * (cur_pad_b / 100.0)))
             vid_disp_h = max(24, frame_h - pad_t_px - pad_b_px)
 
             self._preview_geom = {
@@ -2431,25 +3552,64 @@ class StudioClipperApp(ctk.CTk):
 
             d_bg.rectangle([rx1, ry1, rx2, ry2], fill=(0, 0, 0, 255))
 
-            if self.base_frame_image:
+            in_aspect = in_w / in_h
+            if in_aspect > target_aspect:
+                base_h = in_h
+                base_w = int(round(in_h * target_aspect))
+            else:
+                base_w = in_w
+                base_h = int(round(in_w / target_aspect))
+            base_w -= (base_w % 2)
+            base_h -= (base_h % 2)
+
+            pad_t_calc = int(round(base_h * (cur_pad_t / 100.0)))
+            pad_b_calc = int(round(base_h * (cur_pad_b / 100.0)))
+            avail_w = base_w
+            avail_h = max(64, base_h - pad_t_calc - pad_b_calc)
+            sub_aspect = avail_w / avail_h
+
+            if in_aspect > sub_aspect:
+                crop_base_h = in_h
+                crop_base_w = int(round(in_h * sub_aspect))
+            else:
+                crop_base_w = in_w
+                crop_base_h = int(round(in_w / sub_aspect))
+            crop_base_w -= (crop_base_w % 2)
+            crop_base_h -= (crop_base_h % 2)
+
+            if base_frame:
                 crop_box = (off_x, off_y, off_x + crop_w, off_y + crop_h)
+                req_w = crop_base_w / cur_scale
+                req_h = crop_base_h / cur_scale
+                scale_fit = min(frame_w / req_w, vid_disp_h / req_h)
+                ui_disp_w = max(16, min(frame_w, int(round(crop_w * scale_fit))))
+                ui_disp_h = max(16, min(vid_disp_h, int(round(crop_h * scale_fit))))
+                ui_disp_w -= (ui_disp_w % 2)
+                ui_disp_h -= (ui_disp_h % 2)
+
                 try:
-                    cropped_frame = self.base_frame_image.crop(crop_box).resize((frame_w, vid_disp_h), Image.Resampling.LANCZOS)
+                    cropped_frame = base_frame.crop(crop_box).resize((ui_disp_w, ui_disp_h), Image.Resampling.LANCZOS)
                 except Exception:
-                    cropped_frame = self.base_frame_image.resize((frame_w, vid_disp_h), Image.Resampling.LANCZOS)
+                    cropped_frame = base_frame.resize((ui_disp_w, ui_disp_h), Image.Resampling.LANCZOS)
+
+                ui_pad_x = max(0, int(round((frame_w - ui_disp_w) * cur_pos_x)))
+                ui_pad_y = max(0, int(round((vid_disp_h - ui_disp_h) * cur_pos_y)))
+                ui_pad_x -= (ui_pad_x % 2)
+                ui_pad_y -= (ui_pad_y % 2)
+
+                bg.paste(cropped_frame, (rx1 + ui_pad_x, ry1 + pad_t_px + ui_pad_y))
             else:
                 cropped_frame = Image.new("RGBA", (frame_w, vid_disp_h), (40, 50, 70, 255))
-
-            bg.paste(cropped_frame, (rx1, ry1 + pad_t_px))
+                bg.paste(cropped_frame, (rx1, ry1 + pad_t_px))
 
             # Draw bottom black fade gradient if enabled
-            if self.bottom_fade_var.get() and vid_disp_h > 20:
-                fade_h = max(6, int(vid_disp_h * self.fade_height))
+            if bottom_fade_on and vid_disp_h > 20:
+                fade_h = max(6, int(vid_disp_h * fade_h_val))
                 fade_top = vid_disp_h - fade_h
                 col = Image.new("RGBA", (1, fade_h), (0, 0, 0, 0))
                 for y_idx in range(fade_h):
                     norm = y_idx / max(1, fade_h - 1)
-                    alpha = int(255 * self.fade_opacity * (norm ** 1.35))
+                    alpha = int(255 * fade_o_val * (norm ** 1.35))
                     col.putpixel((0, y_idx), (0, 0, 0, min(255, max(0, alpha))))
                 fade_img = col.resize((frame_w, fade_h), Image.Resampling.NEAREST)
                 bg.paste(fade_img, (rx1, ry1 + pad_t_px + fade_top), fade_img)
@@ -2457,6 +3617,7 @@ class StudioClipperApp(ctk.CTk):
             # Draw sample caption text on preview
             draw_cap = ImageDraw.Draw(bg)
             sample_text = "सिद्धि तो है। हम बढ़ रहे हैं"
+            is_overflow = bool(self.caption_overflow_var.get()) if hasattr(self, "caption_overflow_var") else False
 
             font_nm = self._get_selected_font_name()
             font_sz = self._get_selected_font_size()
@@ -2471,24 +3632,41 @@ class StudioClipperApp(ctk.CTk):
                 except Exception:
                     cap_font = None
 
-            try:
-                bbox = draw_cap.textbbox((0, 0), sample_text, font=cap_font)
-                tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
-            except Exception:
-                tw = len(sample_text) * int(preview_font_sz * 0.6)
-                th = preview_font_sz + 4
-
-            tx = rx1 + max(2, (frame_w - tw) // 2)
-            in_black_bar = hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()
-            if in_black_bar and pad_b_px > 16:
-                ty = ry1 + frame_h - max(12, int(pad_b_px / 2) + int(th / 2))
+            # Split lines depending on Overflow mode vs Word Wrap mode
+            if is_overflow:
+                text_lines = [sample_text]
             else:
-                ty = ry1 + pad_t_px + vid_disp_h - max(12, int(vid_disp_h * 0.12) + int(th / 2))
+                words = sample_text.split()
+                if len(words) >= 4:
+                    mid = len(words) // 2
+                    text_lines = [" ".join(words[:mid]), " ".join(words[mid:])]
+                else:
+                    text_lines = [sample_text]
 
-            style_sel = self.caption_style_menu.get() if hasattr(self, "caption_style_menu") else "✨ Soothe White Light (Soft Clean Glow)"
+            line_metrics = []
+            max_line_w = 0
+            for line_str in text_lines:
+                try:
+                    bbox = draw_cap.textbbox((0, 0), line_str, font=cap_font)
+                    lw = bbox[2] - bbox[0]
+                    lh = bbox[3] - bbox[1]
+                except Exception:
+                    lw = len(line_str) * int(preview_font_sz * 0.6)
+                    lh = preview_font_sz + 4
+                line_metrics.append((lw, lh))
+                if lw > max_line_w:
+                    max_line_w = lw
 
-            # Primary text color from style preset
+            line_step = preview_font_sz + 4
+            total_th = len(text_lines) * line_step
+            sub_pos_frac = max(0.0, min(0.92, sub_y_val))
+            dist_from_bottom_px = int(round(frame_h * sub_pos_frac))
+            base_ty = ry1 + frame_h - dist_from_bottom_px - total_th
+            base_ty = max(ry1 + 4, min(ry1 + frame_h - total_th - 4, base_ty))
+
+            style_sel = cap_style_val
+
+            # Primary text color
             if "Yellow" in style_sel:
                 text_col = (255, 240, 0, 255)
             elif "Cyan" in style_sel or "Aqua" in style_sel:
@@ -2508,45 +3686,50 @@ class StudioClipperApp(ctk.CTk):
             is_bold = "bold" in cb_lower or "thick" in cb_lower or "3.2" in cb_lower
             is_heavy = "heavy" in cb_lower or "extra thick" in cb_lower or "4.5" in cb_lower
 
-            if is_box:
-                pill_pad_x = max(6, int(preview_font_sz * 0.6))
-                pill_pad_y = max(3, int(preview_font_sz * 0.25))
-                draw_cap.rounded_rectangle(
-                    [tx - pill_pad_x, ty - pill_pad_y, tx + tw + pill_pad_x, ty + th + pill_pad_y + 2],
-                    radius=max(3, int(preview_font_sz * 0.4)),
-                    fill=(10, 15, 25, 215),
-                    outline=(55, 65, 81, 255),
-                    width=1
-                )
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
-            elif is_no_border:
-                # Clean text with soft 1px shadow
-                draw_cap.text((tx + 1, ty + 1), sample_text, font=cap_font, fill=(0, 0, 0, 90))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
-            elif is_small:
-                for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 220))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
-            elif is_bold:
-                for ox in range(-2, 3):
-                    for oy in range(-2, 3):
-                        if ox != 0 or oy != 0:
-                            draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
-            elif is_heavy:
-                for ox in range(-3, 4):
-                    for oy in range(-3, 4):
-                        if ox * ox + oy * oy <= 9 and (ox != 0 or oy != 0):
-                            draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
-            else:  # Standard / Medium or Auto Preset
-                if "Soothe White" in style_sel and "auto" in cb_lower:
-                    for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1), (0, 2), (0, 3)]:
-                        draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(15, 23, 42, 170))
-                else:
-                    for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
-                        draw_cap.text((tx + ox, ty + oy), sample_text, font=cap_font, fill=(0, 0, 0, 255))
-                draw_cap.text((tx, ty), sample_text, font=cap_font, fill=text_col)
+            for l_idx, line_str in enumerate(text_lines):
+                lw, lh = line_metrics[l_idx]
+                tx = rx1 + max(2, (frame_w - lw) // 2)
+                ty = base_ty + l_idx * line_step
+
+                if is_box:
+                    pill_pad_x = max(6, int(preview_font_sz * 0.6))
+                    pill_pad_y = max(3, int(preview_font_sz * 0.25))
+                    draw_cap.rounded_rectangle(
+                        [tx - pill_pad_x, ty - pill_pad_y, tx + lw + pill_pad_x, ty + lh + pill_pad_y + 2],
+                        radius=max(3, int(preview_font_sz * 0.4)),
+                        fill=(10, 15, 25, 215),
+                        outline=(55, 65, 81, 255),
+                        width=1
+                    )
+                    draw_cap.text((tx, ty), line_str, font=cap_font, fill=text_col)
+                elif is_no_border:
+                    # Clean text with soft 1px shadow
+                    draw_cap.text((tx + 1, ty + 1), line_str, font=cap_font, fill=(0, 0, 0, 90))
+                    draw_cap.text((tx, ty), line_str, font=cap_font, fill=text_col)
+                elif is_small:
+                    for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        draw_cap.text((tx + ox, ty + oy), line_str, font=cap_font, fill=(0, 0, 0, 220))
+                    draw_cap.text((tx, ty), line_str, font=cap_font, fill=text_col)
+                elif is_bold:
+                    for ox in range(-2, 3):
+                        for oy in range(-2, 3):
+                            if ox != 0 or oy != 0:
+                                draw_cap.text((tx + ox, ty + oy), line_str, font=cap_font, fill=(0, 0, 0, 255))
+                    draw_cap.text((tx, ty), line_str, font=cap_font, fill=text_col)
+                elif is_heavy:
+                    for ox in range(-3, 4):
+                        for oy in range(-3, 4):
+                            if ox * ox + oy * oy <= 9 and (ox != 0 or oy != 0):
+                                draw_cap.text((tx + ox, ty + oy), line_str, font=cap_font, fill=(0, 0, 0, 255))
+                    draw_cap.text((tx, ty), line_str, font=cap_font, fill=text_col)
+                else:  # Standard / Medium or Auto Preset
+                    if "Soothe White" in style_sel and "auto" in cb_lower:
+                        for ox, oy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1), (0, 2), (0, 3)]:
+                            draw_cap.text((tx + ox, ty + oy), line_str, font=cap_font, fill=(15, 23, 42, 170))
+                    else:
+                        for ox, oy in [(-1, -1), (1, -1), (-1, 1), (1, 1), (0, 1), (0, -1), (1, 0), (-1, 0)]:
+                            draw_cap.text((tx + ox, ty + oy), line_str, font=cap_font, fill=(0, 0, 0, 255))
+                    draw_cap.text((tx, ty), line_str, font=cap_font, fill=text_col)
 
             # Glowing frame outline
             outline_col = (99, 102, 241, 255) if self.active_mode == "shorts" else (56, 189, 248, 255)
@@ -2604,8 +3787,8 @@ class StudioClipperApp(ctk.CTk):
                 "target_h": disp_h
             }
 
-            if self.base_frame_image:
-                img = self.base_frame_image.copy().resize((disp_w, disp_h), Image.Resampling.LANCZOS)
+            if base_frame:
+                img = base_frame.copy().resize((disp_w, disp_h), Image.Resampling.LANCZOS)
             else:
                 img = Image.new("RGB", (disp_w, disp_h), color=(20, 24, 34))
 
@@ -2624,15 +3807,15 @@ class StudioClipperApp(ctk.CTk):
             img_rgba = img.convert("RGBA")
             img_composite = Image.alpha_composite(img_rgba, mask)
 
-            if self.bottom_fade_var.get() and (box_y2 > box_y1) and (box_x2 > box_x1):
+            if bottom_fade_on and (box_y2 > box_y1) and (box_x2 > box_x1):
                 box_h = box_y2 - box_y1
-                fade_h = max(4, int(box_h * self.fade_height))
+                fade_h = max(4, int(box_h * fade_h_val))
                 fade_top = max(box_y1, box_y2 - fade_h)
                 actual_fade_h = box_y2 - fade_top
                 fade_col = Image.new("RGBA", (1, actual_fade_h), (0, 0, 0, 0))
                 for y_idx in range(actual_fade_h):
                     norm = y_idx / max(1, actual_fade_h - 1)
-                    alpha = int(255 * self.fade_opacity * (norm ** 1.35))
+                    alpha = int(255 * fade_o_val * (norm ** 1.35))
                     fade_col.putpixel((0, y_idx), (0, 0, 0, min(255, max(0, alpha))))
                 fade_box = fade_col.resize((box_x2 - box_x1, actual_fade_h), Image.Resampling.NEAREST)
                 img_composite.paste(fade_box, (box_x1, fade_top), fade_box)
@@ -2689,17 +3872,22 @@ class StudioClipperApp(ctk.CTk):
             parts.append(f'--caption-style "{cap_style}"')
             cap_border = self._get_selected_caption_border()
             parts.append(f'--caption-border "{cap_border}"')
-            if hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get():
-                parts.append('--sub-margin 35')
+            sub_y = getattr(self, "sub_pos_y", 0.15)
+            parts.append(f'--sub-pos-y {sub_y:.2f}')
+            if hasattr(self, "caption_overflow_var") and self.caption_overflow_var.get():
+                parts.append('--caption-overflow')
 
         music = self.music_entry.get().strip()
         if self.music_switch_var.get() and music and os.path.exists(music):
             parts.append(f'-m "{music}"')
-            parts.append(f'--volume {active_cfg["vol"]:.2f}')
+            parts.append(f'--volume {self.current_vol:.2f}')
 
         audio = self.audio_entry.get().strip() if hasattr(self, "audio_entry") else ""
         if hasattr(self, "audio_switch_var") and self.audio_switch_var.get() and audio and os.path.exists(audio):
             parts.append(f'-a "{audio}"')
+
+        if hasattr(self, "current_video_vol") and abs(self.current_video_vol - 1.0) > 0.01:
+            parts.append(f'--video-volume {self.current_video_vol:.2f}')
 
         return " ".join(parts)
 
@@ -2775,7 +3963,10 @@ class StudioClipperApp(ctk.CTk):
             font_nm = self._get_selected_font_name()
             font_sz = self._get_selected_font_size()
             cap_border = self._get_selected_caption_border()
-            sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
+            sub_y = getattr(self, "sub_pos_y", 0.15)
+
+            use_noise = (self.yt_noise_removal_var.get() if hasattr(self, "yt_noise_removal_var") and getattr(self, "yt_enabled", False) else False)
+            noise_int = getattr(self, "yt_noise_intensity", "Medium")
 
             run_pipeline(
                 video_path=self.video_path,
@@ -2783,7 +3974,7 @@ class StudioClipperApp(ctk.CTk):
                 crop_filter=crop_filter,
                 srt_path=srt if use_srt else None,
                 music_path=music if use_music else None,
-                music_volume=active_cfg["vol"],
+                music_volume=self.current_vol,
                 start_sec=start_off,
                 duration_sec=60.0,
                 use_hw_accel=True,
@@ -2794,8 +3985,13 @@ class StudioClipperApp(ctk.CTk):
                 bottom_fade=active_cfg["bottom_fade"],
                 fade_height=active_cfg.get("fade_height", self.fade_height),
                 fade_opacity=active_cfg.get("fade_opacity", self.fade_opacity),
-                sub_margin_v=sub_marg,
-                audio_path=audio if use_audio else None
+                sub_margin_v=None,
+                audio_path=audio if use_audio else None,
+                sub_pos_y=sub_y,
+                noise_removal=use_noise,
+                noise_intensity=noise_int,
+                video_volume=getattr(self, "current_video_vol", 1.0),
+                caption_overflow=bool(self.caption_overflow_var.get()) if hasattr(self, "caption_overflow_var") else False
             )
 
             preview_path = preview_file
@@ -2883,7 +4079,7 @@ class StudioClipperApp(ctk.CTk):
             font_nm = self._get_selected_font_name()
             font_sz = self._get_selected_font_size()
             cap_border = self._get_selected_caption_border()
-            sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
+            sub_y = getattr(self, "sub_pos_y", 0.15)
 
             def cancel_checker():
                 return self.is_cancelled
@@ -2903,13 +4099,16 @@ class StudioClipperApp(ctk.CTk):
                 self.after(0, lambda: self.status_label.configure(text=msg))
                 self.after(0, lambda: self.progress_bar.set(pct))
 
+            use_noise = (self.yt_noise_removal_var.get() if hasattr(self, "yt_noise_removal_var") and getattr(self, "yt_enabled", False) else False)
+            noise_int = getattr(self, "yt_noise_intensity", "Medium")
+
             generate_3segment_preview(
                 video_path=self.video_path,
                 output_path=preview_file,
                 crop_filter=crop_filter,
                 srt_path=srt if use_srt else None,
                 music_path=music if use_music else None,
-                music_volume=active_cfg["vol"],
+                music_volume=self.current_vol,
                 segment_duration=60.0,
                 percentages=(0.0, 0.45, 0.75),
                 use_hw_accel=True,
@@ -2920,11 +4119,16 @@ class StudioClipperApp(ctk.CTk):
                 bottom_fade=active_cfg["bottom_fade"],
                 fade_height=active_cfg.get("fade_height", self.fade_height),
                 fade_opacity=active_cfg.get("fade_opacity", self.fade_opacity),
-                sub_margin_v=sub_marg,
+                sub_margin_v=None,
                 cancel_check=cancel_checker,
                 proc_callback=set_proc,
                 status_callback=update_progress,
-                audio_path=audio if use_audio else None
+                audio_path=audio if use_audio else None,
+                sub_pos_y=sub_y,
+                noise_removal=use_noise,
+                noise_intensity=noise_int,
+                video_volume=getattr(self, "current_video_vol", 1.0),
+                caption_overflow=bool(self.caption_overflow_var.get()) if hasattr(self, "caption_overflow_var") else False
             )
 
             preview_path = preview_file
@@ -3245,7 +4449,7 @@ class StudioClipperApp(ctk.CTk):
             font_nm = self._get_selected_font_name()
             font_sz = self._get_selected_font_size()
             cap_border = self._get_selected_caption_border()
-            sub_marg = 35 if (hasattr(self, "caption_pos_menu") and "Inside Black" in self.caption_pos_menu.get()) else None
+            sub_y = getattr(self, "sub_pos_y", 0.15)
 
             total = len(entries)
             thumb_dir = out_dir / "thumbnails"
@@ -3302,6 +4506,9 @@ class StudioClipperApp(ctk.CTk):
                     self.current_proc = p
 
                 # Render video clip with chosen ratio framing (1 & 2), and universal music & subtitles (3 & 4)
+                use_noise = (self.yt_noise_removal_var.get() if hasattr(self, "yt_noise_removal_var") and getattr(self, "yt_enabled", False) else False)
+                noise_int = getattr(self, "yt_noise_intensity", "Medium")
+
                 run_pipeline(
                     video_path=self.video_path,
                     output_path=str(out_vid),
@@ -3319,10 +4526,15 @@ class StudioClipperApp(ctk.CTk):
                     bottom_fade=clip_fade,
                     fade_height=clip_fade_h,
                     fade_opacity=clip_fade_o,
-                    sub_margin_v=sub_marg,
+                    sub_margin_v=None,
                     cancel_check=check_cancel,
                     proc_callback=set_proc,
-                    audio_path=audio if use_audio else None
+                    audio_path=audio if use_audio else None,
+                    sub_pos_y=sub_y,
+                    noise_removal=use_noise,
+                    noise_intensity=noise_int,
+                    video_volume=getattr(self, "current_video_vol", 1.0),
+                    caption_overflow=bool(self.caption_overflow_var.get()) if hasattr(self, "caption_overflow_var") else False
                 )
 
                 if self.is_cancelled:

@@ -48,7 +48,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "audio": {
         "enabled": True,
-        "path": ""
+        "path": "",
+        "video_volume": 1.0
     },
     "subtitles": {
         "enabled": True,
@@ -57,14 +58,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "font": "Kohinoor Devanagari",
         "size": "Medium (22pt)",
         "border": "Auto (Preset Default)",
-        "position": "Caption: On Video Fade (Above Padding)"
+        "position": "Caption: On Video Fade (Above Padding)",
+        "pos_y": 0.15,
+        "overflow": False
     },
     "music": {
         "enabled": True,
         "path": "",
         "volume": 0.12
     },
-    "skip_existing": True
+    "skip_existing": True,
+    "youtube_config": {
+        "enabled": False,
+        "auto_captions": True,
+        "noise_removal": True,
+        "noise_intensity": "Medium",
+        "auto_delete_after_days": 2,
+    }
 }
 
 

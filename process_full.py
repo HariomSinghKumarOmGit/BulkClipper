@@ -127,12 +127,14 @@ def combine_video_audio(
     audio_path: str,
     output_path: str,
     cancel_check: Optional[Any] = None,
-    proc_callback: Optional[Any] = None
+    proc_callback: Optional[Any] = None,
+    video_volume: float = 1.0
 ) -> Tuple[bool, str]:
     """
     Combines an external high-quality audio file with a video into a single MP4.
     Copies video stream directly without loss or re-encoding (-c:v copy),
     encodes audio in high-fidelity AAC 320k (-c:a aac -b:a 320k).
+    Applies video_volume adjustment if specified.
     """
     check_dependencies()
     v_info = probe_video(video_path)
@@ -151,6 +153,8 @@ def combine_video_audio(
         "-c:a", "aac",
         "-b:a", "320k"
     ]
+    if abs(video_volume - 1.0) > 0.01:
+        cmd.extend(["-af", f"volume={video_volume:.2f}"])
     if total_dur > 0:
         cmd.extend(["-t", f"{total_dur:.3f}"])
     cmd.extend(["-shortest", "-avoid_negative_ts", "make_zero", output_path])
@@ -184,6 +188,139 @@ def combine_video_audio(
     if rc != 0:
         err_out = "\n".join(error_lines[-5:]) if error_lines else f"FFmpeg exited with error code {rc}"
         return False, err_out
+    return True, output_path
+
+
+def mix_video_background_music(
+    video_path: str,
+    music_path: str,
+    output_path: str,
+    music_volume: float = 0.15,
+    video_volume: float = 1.0,
+    cancel_check: Optional[Any] = None,
+    proc_callback: Optional[Any] = None
+) -> Tuple[bool, str]:
+    """
+    Mixes background music into a video:
+    - If music duration < video duration: loops music continuously until video ends.
+    - Else: combines / mixes directly without looping.
+    - Speech dialogue remains crisp & clear using amix with normalize=0.
+    - Video stream is copied (-c:v copy) for ultra-fast, lossless processing.
+    """
+    check_dependencies()
+    v_info = probe_video(video_path)
+    video_dur = v_info.get("duration", 0.0)
+    has_vid_audio = v_info.get("has_audio", False)
+
+    m_info = probe_audio(music_path)
+    music_dur = m_info.get("duration", 0.0)
+
+    # Make music in loop if it is shorter than long video, else just combine
+    is_shorter = (music_dur > 0 and video_dur > 0 and music_dur < video_dur)
+
+    if has_vid_audio:
+        dialogue_filter = "[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0"
+        if abs(video_volume - 1.0) > 0.01:
+            dialogue_filter += f",volume={video_volume:.2f}"
+        dialogue_filter += "[a_diag]"
+
+        music_filter = f"[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,volume={music_volume:.3f}[a_music]"
+        mix_filter = "[a_diag][a_music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]"
+        filter_complex = f"{dialogue_filter};{music_filter};{mix_filter}"
+        audio_map = "[a_out]"
+    else:
+        filter_complex = f"[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,volume={music_volume:.3f}[a_out]"
+        audio_map = "[a_out]"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-err_detect", "ignore_err",
+        "-max_error_rate", "1.0",
+        "-fflags", "+genpts+discardcorrupt",
+        "-i", video_path
+    ]
+    if is_shorter:
+        cmd.extend(["-stream_loop", "-1"])
+    cmd.extend(["-i", music_path])
+    cmd.extend([
+        "-filter_complex", filter_complex,
+        "-map", "0:v:0",
+        "-map", audio_map,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k"
+    ])
+    if video_dur > 0:
+        cmd.extend(["-t", f"{video_dur:.3f}"])
+    cmd.extend(["-avoid_negative_ts", "make_zero", output_path])
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True
+    )
+    if proc_callback:
+        try:
+            proc_callback(proc)
+        except Exception:
+            pass
+
+    error_lines = []
+    for line in iter(proc.stdout.readline, ""):
+        if cancel_check and cancel_check():
+            proc.kill()
+            proc.wait()
+            raise RuntimeError("Operation cancelled by user.")
+        line_s = line.strip()
+        if any(k in line_s.lower() for k in ["error", "invalid", "failed", "unable"]):
+            error_lines.append(line_s)
+            if len(error_lines) > 20:
+                error_lines.pop(0)
+
+    proc.stdout.close()
+    rc = proc.wait()
+    if rc != 0:
+        # Fallback to hardware-accelerated re-encode if stream copy fails
+        encoders = get_available_encoders()
+        hw_enabled = encoders.get("videotoolbox", False)
+        v_enc = ["-c:v", "h264_videotoolbox", "-b:v", "6000k"] if hw_enabled else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+        cmd_fallback = [
+            "ffmpeg", "-y",
+            "-err_detect", "ignore_err",
+            "-max_error_rate", "1.0",
+            "-fflags", "+genpts+discardcorrupt",
+            "-i", video_path
+        ]
+        if is_shorter:
+            cmd_fallback.extend(["-stream_loop", "-1"])
+        cmd_fallback.extend(["-i", music_path])
+        cmd_fallback.extend([
+            "-filter_complex", filter_complex,
+            "-map", "0:v:0",
+            "-map", audio_map
+        ])
+        cmd_fallback.extend(v_enc)
+        cmd_fallback.extend(["-c:a", "aac", "-b:a", "192k"])
+        if video_dur > 0:
+            cmd_fallback.extend(["-t", f"{video_dur:.3f}"])
+        cmd_fallback.extend(["-avoid_negative_ts", "make_zero", output_path])
+        proc2 = subprocess.Popen(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        if proc_callback:
+            try:
+                proc_callback(proc2)
+            except Exception:
+                pass
+        for line in iter(proc2.stdout.readline, ""):
+            if cancel_check and cancel_check():
+                proc2.kill()
+                proc2.wait()
+                raise RuntimeError("Operation cancelled by user.")
+        proc2.stdout.close()
+        rc2 = proc2.wait()
+        if rc2 != 0:
+            err_out = "\n".join(error_lines[-5:]) if error_lines else f"FFmpeg exited with error code {rc}"
+            return False, err_out
     return True, output_path
 
 
@@ -268,7 +405,12 @@ def build_ass_style(
     font_size: int = 22,
     margin_v: int = 35,
     fallback_color: Optional[str] = None,
-    caption_border: Optional[str] = None
+    caption_border: Optional[str] = None,
+    font_weight: Optional[str] = None,
+    primary_color: Optional[str] = None,
+    highlight_color: Optional[str] = None,
+    spacing: Optional[int] = None,
+    overflow: bool = False
 ) -> str:
     """Builds an ASS force_style string based on caption style preset and custom border/font."""
     chosen_style = None
@@ -283,13 +425,15 @@ def build_ass_style(
         if fallback_color:
             chosen_style["PrimaryColour"] = fallback_color
 
-    primary = chosen_style.get("PrimaryColour", "&H00FFFFFF")
+    primary = primary_color if primary_color else chosen_style.get("PrimaryColour", "&H00FFFFFF")
     outline_col = chosen_style.get("OutlineColour", "&H00000000")
     back_col = chosen_style.get("BackColour", "&H00000000")
     border_style = chosen_style.get("BorderStyle", 1)
     outline = chosen_style.get("Outline", 2.0)
     shadow = chosen_style.get("Shadow", 1.0)
     bold = chosen_style.get("Bold", 1)
+    if font_weight:
+        bold = 1 if "bold" in font_weight.lower() else 0
 
     if caption_border:
         cb_lower = caption_border.lower()
@@ -319,6 +463,7 @@ def build_ass_style(
             shadow = 0.0
             back_col = "&H85000000"
 
+    wrap_style = 2 if overflow else 0
     parts = [
         f"FontName={font_name}",
         f"FontSize={font_size}",
@@ -330,8 +475,13 @@ def build_ass_style(
         f"Outline={outline}",
         f"Shadow={shadow}",
         "Alignment=2",
-        f"MarginV={margin_v}"
+        f"MarginV={margin_v}",
+        f"WrapStyle={wrap_style}"
     ]
+    if highlight_color:
+        parts.append(f"SecondaryColour={highlight_color}")
+    if spacing is not None and spacing > 0:
+        parts.append(f"Spacing={spacing}")
     return ",".join(parts)
 
 
@@ -502,54 +652,53 @@ def compute_crop_filter(
     pos_x = max(0.0, min(1.0, float(pos_x)))
     pos_y = max(0.0, min(1.0, float(pos_y)))
 
-    if scale >= 0.999:
-        # Scale up / Zoom in (or standard 1.0x)
-        cw = int(round(crop_base_w / scale))
-        ch = int(round(crop_base_h / scale))
-        cw -= (cw % 2)
-        ch -= (ch % 2)
-        cw = max(16, min(in_w, cw))
-        ch = max(16, min(in_h, ch))
+    # Unified continuous zoom model:
+    # req_w and req_h represent the unconstrained framing window in source space
+    req_w = crop_base_w / scale
+    req_h = crop_base_h / scale
 
-        max_x = max(0, in_w - cw)
-        max_y = max(0, in_h - ch)
+    # Actual crop dimensions taken from source cannot exceed source bounds
+    cw = int(round(min(float(in_w), req_w)))
+    ch = int(round(min(float(in_h), req_h)))
+    cw -= (cw % 2)
+    ch -= (ch % 2)
+    cw = max(16, min(in_w, cw))
+    ch = max(16, min(in_h, ch))
 
-        off_x = int(round(max_x * pos_x))
-        off_y = int(round(max_y * pos_y))
-        off_x -= (off_x % 2)
-        off_y -= (off_y % 2)
+    # Panning offsets in source space
+    max_x = max(0, in_w - cw)
+    max_y = max(0, in_h - ch)
+    off_x = int(round(max_x * pos_x))
+    off_y = int(round(max_y * pos_y))
+    off_x -= (off_x % 2)
+    off_y -= (off_y % 2)
 
-        parts = [f"crop={cw}:{ch}:{off_x}:{off_y}"]
-        if cw != avail_w or ch != avail_h:
-            parts.append(f"scale={avail_w}:{avail_h}")
-        if pad_top_px > 0 or pad_bottom_px > 0:
-            parts.append(f"pad={base_w}:{base_h}:0:{pad_top_px}:color=black")
+    # Scale factor from source crop to output active window
+    scale_fit = min(avail_w / req_w, avail_h / req_h)
+    disp_w = int(round(cw * scale_fit))
+    disp_h = int(round(ch * scale_fit))
+    disp_w -= (disp_w % 2)
+    disp_h -= (disp_h % 2)
+    disp_w = max(16, min(avail_w, disp_w))
+    disp_h = max(16, min(avail_h, disp_h))
 
-        filter_str = ",".join(parts)
-        return filter_str, cw, ch, off_x, off_y
-    else:
-        # Scale down / Zoom out: fit video within target available window with black padding
-        scaled_w = int(round(avail_w * scale))
-        scaled_h = int(round(scaled_w * (in_h / in_w)))
-        if scaled_h > avail_h:
-            scaled_h = int(round(avail_h * scale))
-            scaled_w = int(round(scaled_h * (in_w / in_h)))
+    # Center or position display within available window
+    pad_in_avail_x = max(0, int(round((avail_w - disp_w) * pos_x)))
+    pad_in_avail_y = max(0, int(round((avail_h - disp_h) * pos_y)))
+    pad_in_avail_x -= (pad_in_avail_x % 2)
+    pad_in_avail_y -= (pad_in_avail_y % 2)
 
-        scaled_w -= (scaled_w % 2)
-        scaled_h -= (scaled_h % 2)
-        scaled_w = max(16, min(avail_w, scaled_w))
-        scaled_h = max(16, min(avail_h, scaled_h))
+    total_pad_x = pad_in_avail_x
+    total_pad_y = pad_top_px + pad_in_avail_y
 
-        pad_x = max(0, int(round((avail_w - scaled_w) * pos_x)))
-        pad_y = max(0, int(round((avail_h - scaled_h) * pos_y)))
-        pad_x -= (pad_x % 2)
-        pad_y -= (pad_y % 2)
+    parts = [f"crop={cw}:{ch}:{off_x}:{off_y}"]
+    if disp_w != cw or disp_h != ch:
+        parts.append(f"scale={disp_w}:{disp_h}")
+    if disp_w < base_w or disp_h < base_h or total_pad_x > 0 or total_pad_y > 0:
+        parts.append(f"pad={base_w}:{base_h}:{total_pad_x}:{total_pad_y}:color=black")
 
-        total_pad_x = pad_x
-        total_pad_y = pad_top_px + pad_y
-
-        filter_str = f"scale={scaled_w}:{scaled_h},pad={base_w}:{base_h}:{total_pad_x}:{total_pad_y}:color=black"
-        return filter_str, scaled_w, scaled_h, total_pad_x, total_pad_y
+    filter_str = ",".join(parts)
+    return filter_str, cw, ch, off_x, off_y
 
 
 def escape_ffmpeg_path(path: str) -> str:
@@ -588,7 +737,18 @@ def run_pipeline(
     sub_margin_v: Optional[int] = None,
     cancel_check: Optional[Any] = None,
     proc_callback: Optional[Any] = None,
-    audio_path: Optional[str] = None
+    audio_path: Optional[str] = None,
+    sub_pos_y: Optional[float] = None,
+    noise_removal: bool = False,
+    noise_intensity: str = "Medium",
+    video_volume: float = 1.0,
+    music_fade_in: float = 0.0,
+    music_fade_out: float = 0.0,
+    music_loop: Optional[bool] = None,
+    caption_weight: Optional[str] = None,
+    caption_highlight: Optional[str] = None,
+    caption_spacing: Optional[int] = None,
+    caption_overflow: bool = False
 ) -> None:
     """Runs the FFmpeg pipeline with optional duration / start for preview or full render."""
     check_dependencies()
@@ -609,6 +769,18 @@ def run_pipeline(
     has_music = bool(music_path and os.path.exists(music_path) and music_volume > 0)
     has_srt = bool(srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 0)
 
+    # Make music in loop if it is shorter than target video duration, else just combine
+    if has_music and music_loop is None:
+        try:
+            m_info = probe_audio(music_path)
+            music_dur = m_info.get("duration", 0.0)
+            target_dur = duration_sec if (duration_sec and duration_sec > 0) else total_dur
+            music_loop = bool(music_dur > 0 and target_dur > 0 and music_dur < target_dur)
+        except Exception:
+            music_loop = True
+    elif music_loop is None:
+        music_loop = True
+
     encoders = get_available_encoders()
     hw_enabled = use_hw_accel and encoders.get("videotoolbox", False)
 
@@ -616,20 +788,16 @@ def run_pipeline(
     temp_shifted_srt = None
     burn_file = None
     if has_srt:
-        sub_ext = Path(srt_path).suffix.lower()
-        # If time-sliced or format is .lrc / .vtt, prepare shifted/converted SRT
-        if (start_sec is not None and (start_sec > 0 or duration_sec is not None)) or sub_ext in [".lrc", ".vtt"]:
-            temp_shifted_srt = str(Path(output_path).parent / f".tmp_sub_{uuid.uuid4().hex[:12]}.srt")
-            end_sec = ((start_sec or 0.0) + duration_sec) if duration_sec else None
-            ok = prepare_shifted_subtitles(
-                sub_path=srt_path,
-                output_srt_path=temp_shifted_srt,
-                start_sec=(start_sec or 0.0),
-                end_sec=end_sec
-            )
-            burn_file = temp_shifted_srt if ok else None
-        else:
-            burn_file = srt_path
+        temp_shifted_srt = str(Path(output_path).parent / f".tmp_sub_{uuid.uuid4().hex[:12]}.srt")
+        end_sec = ((start_sec or 0.0) + duration_sec) if duration_sec else None
+        ok = prepare_shifted_subtitles(
+            sub_path=srt_path,
+            output_srt_path=temp_shifted_srt,
+            start_sec=(start_sec or 0.0),
+            end_sec=end_sec,
+            overflow=caption_overflow
+        )
+        burn_file = temp_shifted_srt if ok else None
 
         if burn_file:
             # If the subtitle file path itself contains single quotes, copy to a clean temp file
@@ -671,15 +839,26 @@ def run_pipeline(
             # Native ASS filter preserves all native styling
             sub_filter = f"ass='{escaped_sub}'"
         else:
+            out_w, out_h = extract_filter_output_dims(crop_filter, v_info["width"], v_info["height"])
             _, _, _, pad_b_px = extract_pad_info(crop_filter)
-            final_margin_v = (sub_margin_v if sub_margin_v is not None else (pad_b_px + 35))
+            if sub_margin_v is not None:
+                final_margin_v = sub_margin_v
+            elif sub_pos_y is not None:
+                final_margin_v = max(10, min(out_h - 40, int(round(out_h * sub_pos_y))))
+            else:
+                final_margin_v = pad_b_px + 35
             style = build_ass_style(
                 style_name=caption_style,
                 font_name=font_name,
                 font_size=font_size,
                 margin_v=final_margin_v,
                 fallback_color=font_color,
-                caption_border=caption_border
+                caption_border=caption_border,
+                font_weight=caption_weight,
+                primary_color=font_color,
+                highlight_color=caption_highlight,
+                spacing=caption_spacing,
+                overflow=caption_overflow
             )
             sub_filter = f"subtitles='{escaped_sub}':force_style='{style}'"
         filter_complex_parts.append(f"[{v_curr}]{sub_filter}[v_sub]")
@@ -691,24 +870,44 @@ def run_pipeline(
         video_map = "0:v"
 
     # 3. Audio Filters (Mix main voice/audio + ducked background music with robust timestamp resample)
+    noise_filter_str = ""
+    if noise_removal:
+        n_lower = (noise_intensity or "medium").lower()
+        if "low" in n_lower:
+            nr, nf = 10, -25
+        elif "high" in n_lower:
+            nr, nf = 28, -35
+        else:
+            nr, nf = 18, -30
+        noise_filter_str = f",highpass=f=85,lowpass=f=9500,afftdn=nr={nr}:nf={nf}:tn=1"
+
+    vol_filter_str = f",volume={video_volume:.2f}" if abs(video_volume - 1.0) > 0.01 else ""
+
+    music_effects = []
+    if music_fade_in > 0:
+        music_effects.append(f"afade=t=in:st=0:d={music_fade_in:.1f}")
+    if music_fade_out > 0 and duration_sec and duration_sec > music_fade_out:
+        music_effects.append(f"afade=t=out:st={(duration_sec - music_fade_out):.1f}:d={music_fade_out:.1f}")
+    music_fx_str = ("," + ",".join(music_effects)) if music_effects else ""
+
     if has_ext_audio:
-        filter_complex_parts.append("[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a_main_clean]")
+        filter_complex_parts.append(f"[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0{noise_filter_str}{vol_filter_str}[a_main_clean]")
         if has_music:
-            filter_complex_parts.append(f"[2:a]volume={music_volume:.3f}[bg_ducked]")
+            filter_complex_parts.append(f"[2:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,volume={music_volume:.3f}{music_fx_str}[bg_ducked]")
             filter_complex_parts.append("[a_main_clean][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]")
             audio_map = "[a_out]"
         else:
             audio_map = "[a_main_clean]"
     elif has_vid_audio:
-        filter_complex_parts.append("[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a0_clean]")
+        filter_complex_parts.append(f"[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0{noise_filter_str}{vol_filter_str}[a0_clean]")
         if has_music:
-            filter_complex_parts.append(f"[1:a]volume={music_volume:.3f}[bg_ducked]")
+            filter_complex_parts.append(f"[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,volume={music_volume:.3f}{music_fx_str}[bg_ducked]")
             filter_complex_parts.append("[a0_clean][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a_out]")
             audio_map = "[a_out]"
         else:
             audio_map = "[a0_clean]"
     elif has_music:
-        filter_complex_parts.append(f"[1:a]volume={music_volume:.3f}[a_out]")
+        filter_complex_parts.append(f"[1:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,volume={music_volume:.3f}{music_fx_str}[a_out]")
         audio_map = "[a_out]"
     else:
         audio_map = None
@@ -730,7 +929,9 @@ def run_pipeline(
             c.extend(["-i", audio_path])
 
         if has_music:
-            c.extend(["-stream_loop", "-1", "-i", music_path])
+            if music_loop:
+                c.extend(["-stream_loop", "-1"])
+            c.extend(["-i", music_path])
 
         if seek_mode == "safe" and start_sec is not None and start_sec > 0:
             c.extend(["-ss", f"{start_sec:.3f}"])
@@ -761,8 +962,13 @@ def run_pipeline(
 
         if duration_sec is not None and duration_sec > 0:
             c.extend(["-t", f"{duration_sec:.3f}"])
+        elif total_dur > 0:
+            c.extend(["-t", f"{total_dur:.3f}"])
 
-        c.extend(["-avoid_negative_ts", "make_zero", "-shortest", output_path])
+        c.extend(["-avoid_negative_ts", "make_zero"])
+        if music_loop:
+            c.append("-shortest")
+        c.append(output_path)
         return c
 
     print("\n" + "=" * 65)
@@ -961,7 +1167,18 @@ def generate_3segment_preview(
     cancel_check: Optional[Any] = None,
     proc_callback: Optional[Any] = None,
     status_callback: Optional[Any] = None,
-    audio_path: Optional[str] = None
+    audio_path: Optional[str] = None,
+    sub_pos_y: Optional[float] = None,
+    noise_removal: bool = False,
+    noise_intensity: str = "Medium",
+    video_volume: float = 1.0,
+    music_fade_in: float = 0.0,
+    music_fade_out: float = 0.0,
+    music_loop: Optional[bool] = None,
+    caption_weight: Optional[str] = None,
+    caption_highlight: Optional[str] = None,
+    caption_spacing: Optional[int] = None,
+    caption_overflow: bool = False
 ) -> str:
     """
     Generates a 3-segment combined test preview video:
@@ -1029,7 +1246,18 @@ def generate_3segment_preview(
                 sub_margin_v=sub_margin_v,
                 cancel_check=cancel_check,
                 proc_callback=proc_callback,
-                audio_path=audio_path
+                audio_path=audio_path,
+                sub_pos_y=sub_pos_y,
+                noise_removal=noise_removal,
+                noise_intensity=noise_intensity,
+                video_volume=video_volume,
+                music_fade_in=music_fade_in,
+                music_fade_out=music_fade_out,
+                music_loop=music_loop,
+                caption_weight=caption_weight,
+                caption_highlight=caption_highlight,
+                caption_spacing=caption_spacing,
+                caption_overflow=caption_overflow
             )
 
         if cancel_check and cancel_check():
@@ -1071,11 +1299,13 @@ def main():
     parser.add_argument("--pad-top", type=float, default=0.0, help="Top frame padding percentage (default: 0.0)")
     parser.add_argument("--pad-bottom", type=float, default=0.0, help="Bottom frame padding percentage (default: 0.0)")
     parser.add_argument("--sub-margin", type=int, default=None, help="Vertical margin for subtitles (defaults to pad_bottom + 35)")
+    parser.add_argument("--sub-pos-y", type=float, default=None, help="Vertical position for subtitles as fraction from bottom (0.0 to 1.0, e.g. 0.15 for 15%%, 0.5 for center)")
     parser.add_argument("--bottom-fade", "--black-fade", dest="bottom_fade", action="store_true", default=False, help="Add smooth bottom black fade gradient for caption contrast")
     parser.add_argument("--fade-height", type=float, default=0.38, help="Fraction of frame height for bottom black fade (default: 0.38)")
     parser.add_argument("--fade-opacity", type=float, default=0.92, help="Maximum opacity of bottom black fade (default: 0.92)")
     parser.add_argument("-s", "--srt", "--sub", dest="srt", help="Path to subtitle or lyrics file (.srt, .ass, .lrc, .vtt)")
     parser.add_argument("-a", "--audio", help="Path to high-quality / separate main audio file (.m4a, .mp3, .wav, .aac, .opus) to replace or supply video audio")
+    parser.add_argument("--video-volume", type=float, default=1.0, help="Main video / audio volume multiplier (1.0 = normal, 1.5 = 150%%, 2.0 = 200%%)")
     parser.add_argument("-m", "--music", help="Path to background music file")
     parser.add_argument("--volume", type=float, default=0.12, help="Background music volume multiplier (default: 0.12)")
     parser.add_argument("--start", type=float, default=None, help="Start time offset in seconds")
@@ -1086,6 +1316,7 @@ def main():
     parser.add_argument("--font-color", default="&H00FFFFFF", help="Font color for subtitles (&H00FFFFFF for white, &H0000FFFF for yellow)")
     parser.add_argument("--caption-style", default="✨ Soothe White Light (Soft Clean Glow)", help="Preset caption style (e.g. 'Soothe White Light', 'Viral Reel Yellow', 'Frosted Pill Box')")
     parser.add_argument("--caption-border", default="Auto (Preset Default)", help="Caption border style (No Border, Small Border, Standard Border, Bold Border, Heavy Outline, Opaque Box, Auto)")
+    parser.add_argument("--caption-overflow", "--overflow", dest="caption_overflow", action="store_true", default=False, help="Set caption text to single-line overflow mode (no word wrap)")
     parser.add_argument("--multi-preview", action="store_true", help="Generate a 3-segment combined test preview (0%%, 45%%, 75%% of video length, 1 min each combined into 1 video)")
     parser.add_argument("--preview-seg-dur", type=float, default=60.0, help="Duration of each segment in multi-preview in seconds (default: 60.0s / 1 min)")
     parser.add_argument("--bitrate", default="6000k", help="Video bitrate for VideoToolbox encoding (default 6000k)")
@@ -1132,7 +1363,10 @@ def main():
             fade_height=args.fade_height,
             fade_opacity=args.fade_opacity,
             sub_margin_v=args.sub_margin,
-            audio_path=args.audio
+            audio_path=args.audio,
+            sub_pos_y=args.sub_pos_y,
+            video_volume=args.video_volume,
+            caption_overflow=args.caption_overflow
         )
     else:
         run_pipeline(
@@ -1155,7 +1389,10 @@ def main():
             fade_height=args.fade_height,
             fade_opacity=args.fade_opacity,
             sub_margin_v=args.sub_margin,
-            audio_path=args.audio
+            audio_path=args.audio,
+            sub_pos_y=args.sub_pos_y,
+            video_volume=args.video_volume,
+            caption_overflow=args.caption_overflow
         )
 
 

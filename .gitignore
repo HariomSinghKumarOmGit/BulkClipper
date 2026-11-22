@@ -39,4 +39,8 @@ env/
 !/approved_clips/.gitkeep
 /static_previews/*
 !/static_previews/.gitkeep
+/downloaded_videos/*
+!/downloaded_videos/.gitkeep
+!/downloaded_videos/audio/
+!/downloaded_videos/audio/.gitkeep
 assets/bottom_fade_*x*.png
